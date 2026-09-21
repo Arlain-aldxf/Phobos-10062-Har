@@ -1,0 +1,81 @@
+name: build-10062
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'action-10062*'
+
+env:
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: DevBuild
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: checkout (with submodules)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: strip the ATL include from YRpp
+      shell: pwsh
+      run: |
+        $f = 'YRpp\Interfaces.h'
+        if (-not (Test-Path $f)) { throw "missing $f - cannot patch ATL dependency" }
+
+        Write-Host '=== before ==='
+        Get-Content $f -TotalCount 6 | ForEach-Object { Write-Host ('  ' + $_) }
+
+        $text = [IO.File]::ReadAllText($f)
+        $text = $text -replace '(?m)^\s*#include\s*<atlbase\.h>\s*\r?\n', ''
+        [IO.File]::WriteAllText($f, $text)
+
+        Write-Host '=== after ==='
+        Get-Content $f -TotalCount 6 | ForEach-Object { Write-Host ('  ' + $_) }
+
+        $still = Get-Content $f -Raw
+        if ($still -match 'atlbase') { throw 'atlbase.h is still referenced - patch did not work' }
+        Write-Host 'ATL include removed - OK'
+
+    - name: build phobos
+      uses: ./.github/actions/build-phobos
+      with:
+        sln-path: ${{env.SOLUTION_FILE_PATH}}
+        build-config: ${{env.BUILD_CONFIGURATION}}
+
+  diagnostics:
+    runs-on: windows-latest
+
+    steps:
+    - name: collect environment info
+      shell: pwsh
+      run: |
+        $out = @()
+        $out += '===== atlbase.h ====='
+        $atl = @(Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio','C:\Program Files\Microsoft Visual Studio' -Recurse -Filter 'atlbase.h' -ErrorAction SilentlyContinue)
+        if ($atl.Count -gt 0) { $atl | ForEach-Object { $out += ('FOUND: ' + $_.FullName) } } else { $out += 'NOT FOUND' }
+
+        $out += ''
+        $out += '===== comdef.h ====='
+        $cd = @(Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Recurse -Filter 'comdef.h' -ErrorAction SilentlyContinue)
+        if ($cd.Count -gt 0) { $cd | ForEach-Object { $out += ('FOUND: ' + $_.FullName) } } else { $out += 'NOT FOUND' }
+
+        $out += ''
+        $out += '===== toolsets ====='
+        Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | ForEach-Object { $out += $_.FullName }
+
+        $out += ''
+        $out += '===== msbuild ====='
+        Get-Command msbuild -ErrorAction SilentlyContinue | ForEach-Object { $out += $_.Source }
+
+        $out | Set-Content -Path 'envinfo.txt' -Encoding utf8
+        $out | ForEach-Object { Write-Host $_ }
+
+    - name: upload environment info
+      uses: actions/upload-artifact@v4
+      with:
+        name: env-info
+        path: envinfo.txt

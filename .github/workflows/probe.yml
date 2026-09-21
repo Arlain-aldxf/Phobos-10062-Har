@@ -1,0 +1,43 @@
+name: env-probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'action-10062*'
+
+jobs:
+  probe:
+    runs-on: windows-latest
+
+    steps:
+    - name: checkout (with submodules)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: probe build environment
+      shell: pwsh
+      run: |
+        Write-Host '===== 1. atlbase.h (ATL header, the missing one) ====='
+        $atl = Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio','C:\Program Files\Microsoft Visual Studio' -Recurse -Filter 'atlbase.h' -ErrorAction SilentlyContinue
+        if ($atl) { $atl | ForEach-Object { Write-Host ('  FOUND: ' + $_.FullName) } } else { Write-Host '  NOT FOUND - no ATL on this machine' }
+
+        Write-Host ''
+        Write-Host '===== 2. comdef.h (must exist, from Windows SDK) ====='
+        $cd = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Recurse -Filter 'comdef.h' -ErrorAction SilentlyContinue
+        if ($cd) { $cd | ForEach-Object { Write-Host ('  FOUND: ' + $_.FullName) } } else { Write-Host '  NOT FOUND' }
+
+        Write-Host ''
+        Write-Host '===== 3. Visual Studio and toolsets ====='
+        Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('  VS: ' + $_.FullName) }
+        Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('  Toolset: ' + $_.FullName) }
+
+        Write-Host ''
+        Write-Host '===== 4. msbuild ====='
+        Get-Command msbuild -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('  ' + $_.Source) }
+
+        Write-Host ''
+        Write-Host '===== 5. YRpp submodule ====='
+        Write-Host ('  YRpp file count: ' + (Get-ChildItem 'YRpp' -Recurse -File -ErrorAction SilentlyContinue).Count)
+        Get-Content 'YRpp\Interfaces.h' -TotalCount 6 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('  ' + $_) }

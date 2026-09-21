@@ -52,6 +52,9 @@ enum class PhobosScripts : unsigned int
 	MoveToFriendlyFarther = 10059,
 	MoveToTypeFriendlyFarther = 10060,
 	RandomMoveToTypeFriendlyFarther = 10061,
+	// Enter (dock) into the closest friendly object from a specific list, then unload once.
+	// Currently meant for harvesters delivering ore to an allied refinery.
+	MoveToTypeFriendlyCloserEnter = 10062,
 	// Sub-range 10100-10999 is for "general purpose" actions
 	TimedAreaGuard = 10100,
 	WaitUntilFullAmmo = 10101,
@@ -233,6 +236,10 @@ public:
 	static TechnoClass* FindBestObject(TechnoClass* pTechno, int method, int calcThreatMode = 0, bool pickAllies = false, int attackAITargetType = -1, int idxAITargetTypeItem = -1);
 	static void Mission_Move_List(TeamClass* pTeam, int calcThreatMode = 0, bool pickAllies = false, int attackAITargetType = -1);
 	static void Mission_Move_List1Random(TeamClass* pTeam, int calcThreatMode = 0, bool pickAllies = false, int attackAITargetType = -1, int idxAITargetTypeItem = -1);
+	static void Mission_Move_List_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType);
+	static void Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType, int idxAITargetTypeItem);
+	static bool HandleTargetEntryTimeout(TeamClass* pTeam);
+	static bool IsTargetObjectEntrable(TechnoClass* pTarget);
 
 private:
 	static void ModifyCurrentTriggerWeight(TeamClass* pTeam, bool forceJumpLine = true, double modifier = 0);

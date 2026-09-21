@@ -26,6 +26,9 @@ public:
 		int Countdown_RegroupAtLeader;
 		int MoveMissionEndMode;
 		int WaitNoTargetCounter;
+		// Countdown (in frames) for the "move to and enter the closest friendly target" actions.
+		// While it is running the team keeps trying to dock into the selected target.
+		int DockActionTimeout;
 		CDTimerClass WaitNoTargetTimer;
 		CDTimerClass ForceJump_Countdown;
 		int ForceJump_InitialCountdown;
@@ -41,6 +44,7 @@ public:
 			, Countdown_RegroupAtLeader { -1 }
 			, MoveMissionEndMode { 0 }
 			, WaitNoTargetCounter { 0 }
+			, DockActionTimeout { 0 }
 			, WaitNoTargetTimer { }
 			, ForceJump_Countdown { }
 			, ForceJump_InitialCountdown { -1 }

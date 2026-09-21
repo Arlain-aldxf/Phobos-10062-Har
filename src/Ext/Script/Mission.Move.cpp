@@ -408,6 +408,308 @@ void ScriptExt::Mission_Move_List(TeamClass* pTeam, int calcThreatMode, bool pic
 	}
 }
 
+void ScriptExt::Mission_Move_List_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType)
+{
+	const auto pTeamData = TeamExt::ExtMap.Find(pTeam);
+	pTeamData->IdxSelectedObjectFromAIList = -1;
+
+	if (attackAITargetType < 0)
+	{
+		const auto pScript = pTeam->CurrentScript;
+		attackAITargetType = pScript->Type->ScriptActions[pScript->CurrentMission].Argument;
+	}
+
+	if (RulesExt::Global()->AITargetTypesLists.size() > 0
+		&& (size_t)attackAITargetType < RulesExt::Global()->AITargetTypesLists.size()
+		&& RulesExt::Global()->AITargetTypesLists[attackAITargetType].size() > 0)
+	{
+		ScriptExt::Mission_Move_Enter(pTeam, calcThreatMode, pickAllies, attackAITargetType, -1);
+	}
+	else
+	{
+		// Nothing to pick the target from, so there is nothing this action could do.
+		// Do not leave the team stuck on a broken action, just end it.
+		pTeam->StepCompleted = true;
+
+		const auto pScript = pTeam->CurrentScript;
+		ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Jump to next line: empty or missing [AITargetTypes] list index %d\n",
+			pTeam->Type->ID,
+			pScript->Type->ID,
+			pScript->CurrentMission,
+			pScript->Type->ScriptActions[pScript->CurrentMission].Action,
+			pScript->Type->ScriptActions[pScript->CurrentMission].Argument,
+			attackAITargetType);
+	}
+}
+
+void ScriptExt::Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType, int idxAITargetTypeItem)
+{
+	const auto pTeamData = TeamExt::ExtMap.Find(pTeam);
+	const auto pScript = pTeam->CurrentScript;
+	const auto pScriptType = pScript->Type;
+	const auto& node = pScriptType->ScriptActions[pScript->CurrentMission];
+
+	// Find the Leader
+	auto pLeaderUnit = pTeamData->TeamLeader;
+
+	if (!ScriptExt::IsUnitAvailable(pLeaderUnit, true))
+	{
+		pLeaderUnit = ScriptExt::FindTheTeamLeader(pTeam);
+		pTeamData->TeamLeader = pLeaderUnit;
+	}
+
+	if (!pLeaderUnit)
+	{
+		pTeamData->DockActionTimeout = 0;
+		pTeam->StepCompleted = true;
+
+		ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Jump to next line (Reason: No Leader)\n",
+			pTeam->Type->ID,
+			pScriptType->ID,
+			pScript->CurrentMission,
+			node.Action,
+			node.Argument);
+
+		return;
+	}
+
+	auto pFocus = abstract_cast<TechnoClass*>(pTeam->Focus);
+
+	if (!pFocus)
+	{
+		// This part of the code is used for picking a new target, the closest friendly object from the list.
+		const auto pSelectedTarget = ScriptExt::FindBestObject(pLeaderUnit, node.Argument, calcThreatMode, pickAllies, attackAITargetType, idxAITargetTypeItem);
+
+		if (!pSelectedTarget)
+		{
+			// No target was found with the specific criteria.
+			pTeamData->DockActionTimeout = 0;
+
+			if (!pTeamData->WaitNoTargetTimer.InProgress() && pTeamData->WaitNoTargetTimer.Completed())
+			{
+				pTeamData->WaitNoTargetCounter = 30;
+				pTeamData->WaitNoTargetTimer.Start(30);
+			}
+
+			if (pTeamData->WaitNoTargetAttempts != 0 && pTeamData->WaitNoTargetTimer.Completed())
+			{
+				pTeamData->WaitNoTargetCounter = 30;
+				pTeamData->WaitNoTargetTimer.Start(30); // No target? let's wait some frames
+
+				return;
+			}
+
+			// This action finished
+			pTeam->StepCompleted = true;
+
+			const int nextMission = pScript->CurrentMission + 1;
+			const auto& nextNode = pScriptType->ScriptActions[nextMission];
+			ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Jump to next line: %d = %d,%d (new target NOT FOUND)\n",
+				pTeam->Type->ID,
+				pScriptType->ID,
+				pScript->CurrentMission,
+				node.Action,
+				node.Argument,
+				nextMission,
+				nextNode.Action,
+				nextNode.Argument);
+
+			return;
+		}
+
+		if (!ScriptExt::IsTargetObjectEntrable(pSelectedTarget))
+		{
+			// The object can not be entered or docked into by anything, so picking it would only
+			// stall the team. End this action instead.
+			pTeamData->DockActionTimeout = 0;
+			pTeam->StepCompleted = true;
+
+			ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Jump to next line: [%s] (UID: %lu) is not an enterable object\n",
+				pTeam->Type->ID,
+				pScriptType->ID,
+				pScript->CurrentMission,
+				node.Action,
+				node.Argument,
+				pSelectedTarget->GetTechnoType()->get_ID(),
+				pSelectedTarget->UniqueID);
+
+			return;
+		}
+
+		pFocus = pSelectedTarget;
+		pTeam->Focus = pSelectedTarget;
+		pTeamData->DockActionTimeout = 600; // 600 frames, plenty enough for a harvester to arrive and unload
+		pTeamData->WaitNoTargetAttempts = 0; // Disable Script Waits if there are any because a new target was selected
+		pTeamData->WaitNoTargetTimer.Stop();
+		pTeamData->WaitNoTargetCounter = 0; // Disable Script Waits if there are any because a new target was selected
+
+		ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Leader [%s] (UID: %lu) selected [%s] (UID: %lu) to move in and unload.\n",
+			pTeam->Type->ID,
+			pScriptType->ID,
+			pScript->CurrentMission,
+			node.Action,
+			node.Argument,
+			pLeaderUnit->GetTechnoType()->get_ID(),
+			pLeaderUnit->UniqueID,
+			pSelectedTarget->GetTechnoType()->get_ID(),
+			pSelectedTarget->UniqueID);
+	}
+	else
+	{
+		// This part of the code is used for updating the "Enter" mission in each team unit.
+		if (ScriptExt::HandleTargetEntryTimeout(pTeam))
+		{
+			pTeamData->DockActionTimeout = 0;
+			pTeamData->IdxSelectedObjectFromAIList = -1;
+			pTeam->Focus = nullptr;
+
+			// This action finished
+			pTeam->StepCompleted = true;
+
+			const int nextMission = pScript->CurrentMission + 1;
+			const auto& nextNode = pScriptType->ScriptActions[nextMission];
+			ScriptExt::Log("AI Scripts - Move Enter: [%s] [%s] (line: %d = %d,%d) Jump to next line: %d = %d,%d (Reason: All team members have unloaded | timeout)\n",
+				pTeam->Type->ID,
+				pScriptType->ID,
+				pScript->CurrentMission,
+				node.Action,
+				node.Argument,
+				nextMission,
+				nextNode.Action,
+				nextNode.Argument);
+
+			return;
+		}
+	}
+
+	// Give every team member the order to move into the focused object and unload there.
+	if (pFocus)
+	{
+		for (auto pFoot = pTeam->FirstUnit; pFoot; pFoot = pFoot->NextTeamMember)
+		{
+			if (!ScriptExt::IsUnitAvailable(pFoot, false))
+			{
+				// Units still inside a transport are neither docked nor unloaded, but they can not be
+				// ordered yet either. Skip them until they are deployed.
+				if (pFoot && !pFoot->InLimbo && !pFoot->Absorbed && pFoot->Transporter)
+					pTeam->StepCompleted = false;
+
+				continue;
+			}
+
+			auto const pUnit = abstract_cast<UnitClass*, true>(pFoot);
+
+			if (!pUnit || !pUnit->Type->Harvester)
+			{
+				// Only harvesters have anything to unload, other members simply wait for them.
+				continue;
+			}
+
+			if (pUnit->GetStoragePercentage() <= 0.0)
+			{
+				// Nothing left to unload, this member is done.
+				continue;
+			}
+
+			// Docked into the target and unloading there, do not interrupt it.
+			if (pUnit->HasAnyLink() && pUnit->GetNthLink(0) == pFocus)
+				continue;
+
+			const auto currentMission = pUnit->GetCurrentMission();
+
+			// The "Enter" order stays active (and keeps retrying on its own) until the object is
+			// actually entered, so it must not be re-issued every frame. Only re-issue while the
+			// harvester is still on its way there.
+			if (currentMission != Mission::Enter && currentMission != Mission::Unload)
+			{
+				const CoordStruct coord = TechnoExt::PassengerKickOutLocation(pFocus, pUnit, 10);
+				auto const pDestination = MapClass::Instance.TryGetCellAt(coord != CoordStruct::Empty ? coord : pFocus->Location);
+
+				if (!pDestination)
+				{
+					// Nowhere to dock at, this action can not be done by this member.
+					continue;
+				}
+
+				const CellStruct destinationCell = pDestination->MapCoords;
+
+				if (pUnit->Locomotor->Can_Enter_Cell(destinationCell) != Move::OK)
+				{
+					// The place next to the object is taken right now (the pads of a refinery are
+					// often busy), keep the harvester waiting nearby instead of killing the action.
+					continue;
+				}
+
+				pUnit->SetArchiveTarget(pFocus);
+				pUnit->SetTarget(nullptr);
+				pUnit->QueueMission(Mission::Move, false);
+				pUnit->SetDestination(pDestination, true);
+
+				// Now enter (dock into) the target object.
+				pUnit->QueueMission(Mission::Enter, false);
+
+				// Aircraft hack. I hate how this game auto-manages the aircraft missions.
+				if (pFoot->WhatAmI() == AbstractType::Aircraft && pFoot->Ammo > 0 && !pFoot->IsInAir())
+					pFoot->QueueMission(Mission::Move, false);
+			}
+			else if (currentMission == Mission::Enter && !pUnit->Locomotor->Is_Moving())
+			{
+				// Driving towards the object was interrupted. Give the order again.
+				pUnit->QueueMission(Mission::Enter, false);
+			}
+
+			// This member still has ore to deliver, so the action is not finished yet.
+			pTeam->StepCompleted = false;
+		}
+	}
+}
+
+bool ScriptExt::HandleTargetEntryTimeout(TeamClass* pTeam)
+{
+	const auto pTeamData = TeamExt::ExtMap.Find(pTeam);
+
+	if (pTeamData->DockActionTimeout > 0)
+		pTeamData->DockActionTimeout--;
+
+	bool allUnloaded = true;
+
+	for (auto pFoot = pTeam->FirstUnit; pFoot; pFoot = pFoot->NextTeamMember)
+	{
+		if (!ScriptExt::IsUnitAvailable(pFoot, false))
+		{
+			// A member that is still inside a transport has not delivered anything yet.
+			if (pFoot && !pFoot->InLimbo && !pFoot->Absorbed && pFoot->Transporter)
+				allUnloaded = false;
+
+			continue;
+		}
+
+		auto const pUnit = abstract_cast<UnitClass*, true>(pFoot);
+
+		if (pUnit && pUnit->Type->Harvester && pUnit->GetStoragePercentage() > 0.0)
+			allUnloaded = false;
+	}
+
+	// The countdown is a safety net: without it a team whose target can not be reached would
+	// stay on this action line forever.
+	return allUnloaded || pTeamData->DockActionTimeout <= 0;
+}
+
+bool ScriptExt::IsTargetObjectEntrable(TechnoClass* pTarget)
+{
+	if (auto const pBuilding = abstract_cast<BuildingClass*, true>(pTarget))
+	{
+		// Refineries and other enterable structures are handled by Mission::Enter,
+		// buildings without anything to enter would stall the team.
+		return pBuilding->Type->Refinery
+			|| pBuilding->Type->DockUnload
+			|| pBuilding->Type->Grinding
+			|| pBuilding->Type->NumberOfDocks > 0;
+	}
+
+	return false;
+}
+
 void ScriptExt::Mission_Move_List1Random(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType, int idxAITargetTypeItem)
 {
 	bool selected = false;

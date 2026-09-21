@@ -233,6 +233,27 @@ x=i,n             ; For i values check the next table
 | 10059    | Target Type#            | Friendly       | Farther                |                                              |
 | 10060    | `[AITargetType]` index# | Friendly       | Farther                |                                              |
 | 10061    | `[AITargetType]` index# | Friendly       | Farther                | Picks 1 random target from the selected list |
+| 10062    | `[AITargetType]` index# | Friendly       | Closer                 | Moves in and enters it instead of only moving next to it. Used by harvesters to unload ore into a friendly refinery |
+
+##### `10062` Move Team Into the Closest Friendly Object From a List
+
+- Unlike `10054`, which only makes the TaskForce drive next to the selected object, this action makes the TaskForce actually enter it. Every member of the TaskForce is ordered to enter the object, which is the same order the player gives by clicking on a building with an "enter" cursor.
+- A member that can not enter the object itself (for example an escort unit that is not a harvester) simply waits instead of being ordered around.
+- The action only ends when there is nothing left to deliver, that is, when all harvesters in the TaskForce have unloaded everything they carry, or when the object can not be entered within a certain amount of time. A member that can not dock right away (all pads of the object being busy, for example) keeps waiting and retrying by itself.
+- The intended use is letting an AI team of harvesters deliver ore to an allied refinery: the refinery that is unloaded into is the one that receives the money, so a TeamType of harvesters using this action on an allied refinery effectively mines for that ally. Ore is still harvested by the `11,10` (`Harvest`) action or by the harvester's own logic, this action only handles the delivery.
+- The object has to be enterable (a refinery, a grinding facility or anything else that something can dock into) and the TaskForce member has to be something that can enter it, otherwise the action ends right away.
+
+In `aimd.ini`:
+```ini
+[SOMESCRIPTTYPE]  ; ScriptType
+x=10062,0         ; 0 = index of the [AITargetTypes] list holding the refinery TechnoTypes
+```
+
+In `rulesmd.ini`:
+```ini
+[AITargetTypes]   ; List of TechnoType lists
+0=GAREFN,GAOREP   ; Refineries the harvesters should deliver to
+```
 
 #### `10100-10999` General Purpose
 

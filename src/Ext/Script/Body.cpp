@@ -154,6 +154,10 @@ void ScriptExt::ProcessAction(TeamClass* pTeam)
 		// Move to the farther specific friendly target
 		ScriptExt::Mission_Move_List(pTeam, 3, true);
 		break;
+	case PhobosScripts::MoveToTypeFriendlyCloserEnter:
+		// Enter the closest specific friendly target (dock, unload) instead of just moving to it
+		ScriptExt::Mission_Move_List_Enter(pTeam, 2, true, argument);
+		break;
 	case PhobosScripts::ModifyTargetDistance:
 		// AISafeDistance equivalent for Mission_Move()
 		ScriptExt::SetCloseEnoughDistance(pTeam);

@@ -259,57 +259,66 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 		}
 	}
 
-	// ---- ① 防崩：把 ESI 换成合法建筑 ----
+	// ---- ① 已经对接上精炼厂了 → 立刻停手！----
+	//
+	// ⚠️⚠️⚠️ 这条必须在【最前面】，而且必须早于任何写操作 —— 这是实测结论。
+	//
+	// 状态记录仪抓到的真相（probe10062.log，两行一组交替出现）：
+	//     mission=10 status=2 archiveTarget=132ABD18  linkedToTarget=0
+	//     mission=10 status=2 archiveTarget=00000000  linkedToTarget=1   <- 对接上了
+	//     mission=10 status=2 archiveTarget=132ABD18  linkedToTarget=0   <- 又被拆开
+	//     ...
+	//
+	// 即：**矿车确实跟精炼厂对接成功过（linkedToTarget=1），
+	//     但我们的钩子每帧重写目标，把对接状态反复打断** ——
+	//     永远在"对接成功 → 被打断 → 再对接"之间翻滚，倒矿自然完不成。
+	//
+	// 之前把 HasAnyLink() 检查排在 ArchiveTarget 检查【后面】是个错误：
+	// ArchiveTarget 一旦非空，函数在那行就 return 了，永远走不到 link 检查。
+	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
+		return Continue;
+
+	// ---- ② 防崩：把 ESI 换成合法建筑 ----
 	// 引擎紧接着会把它当"建筑"解引用；不给它一个真的就会崩在 0x73EB9F。
+	// （只写寄存器，不写任何字段 —— 见下面为什么不写 ArchiveTarget）
 	R->ESI(pTarget);
 
-	// ⚠️⚠️ 守卫：目标已经定好了就【彻底停止插手】
+	// ⚠️⚠️ 守卫：目标已经定好了就【彻底停手】
 	//
 	//    这个钩子**每一帧都会被调用**（矿车满载期间引擎一直在跑 Harvest 任务），
 	//    而钩点 0x73EB84 本身就位于 Harvest 任务内部 ——
-	//    所以 currentMission 永远是 Harvest，"Enter/Unload 就不打扰"这种判断
-	//    在这里根本用不上（实测教训）。
+	//    所以"Enter/Unload 就不打扰"这种判断在这里根本用不上（实测教训）。
 	//
 	//    真正该判断的是：**这辆矿车是不是已经在去这个目标的路上了**。
 	//    若是，就让引擎自己走完"走到 → 对接 → 倒矿"，别再重下指令。
 	//
 	//    反面教训（都实测过）：
 	//      · 每帧重下 Move/Enter → 矿车在矿场旁疯狂抖动、超时空矿车留下一串传送残影
-	//      · 不守卫而只重下 Move     → 矿车停在矿口不进（"准备对接"被反复重置）
+	//      · 只重下 Move 不守卫   → 矿车停在矿口不进（"准备对接"被反复重置）
 	//
 	//    Mission.Move.cpp 的注释也是这个意思："Only re-issue while the harvester
 	//    is still on its way there."
 	if (pFoot->ArchiveTarget == pTarget)
 		return Continue;
 
-	// 已经挂上目标（正在倒矿）→ 更不要打扰
-	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
-		return Continue;
-
-	// ⚠️⚠️ 这一段的每一行都是实测换来的，别随手改。三种写法的实测结果：
+	// ⚠️⚠️ 这一段的每一行都是实测换来的，别随手改。
 	//
-	//   (A) SetDestination(旁边那格) + Move + Enter
-	//       → 矿车【真的会移动】到盟友矿场，但停在门口不进（把旁边那格当成终点）
+	//   为什么【不写 ArchiveTarget】：
+	//     状态记录仪显示，只要我们不碰这个字段，引擎自己会：
+	//         设立目标 -> 对接成功（link 建立）-> 清空 ArchiveTarget -> 倒矿
+	//     而我们每写一次 ArchiveTarget，就把这个流程打回原点。所以这里只下达
+	//     "移动 + 进入"，目标字段交给引擎自己维护。
 	//
-	//   (B) SetDestination(建筑本身) + Move + Enter
-	//       → 待验证（本版）
-	//
-	//   (C) Harvest + NextMission + MissionStatus=2（照抄 Hooks.Harvester.cpp）
-	//       → 矿车【完全不动了】：NextMission() 会把刚设的 MissionStatus 冲掉，
-	//         矿车进入"该去采矿"的状态，原地发呆
-	//
-	//   结论：**移动必须靠 SetDestination + QueueMission(Move)** —— 这是唯一
-	//   被实测证明能把矿车开过去的写法；(C) 那套虽然语义正确，但会和
-	//   NextMission() 互相破坏，不能用在这里。
-	//
-	//   目的地用【建筑本身】：玩家右键点建筑下达"进入"时引擎发的就是这个，
-	//   由引擎自己去算该停到哪个停机位。
+	//   移动必须靠 SetDestination + QueueMission(Move)：
+	//     (A) 目的地=旁边那格 → 矿车真的会移动过去，但停在门口不进
+	//     (B) 目的地=建筑本身 → 本版（让引擎自己去算该停哪个停机位）
+	//     (C) Harvest + NextMission + MissionStatus=2（照抄 Hooks.Harvester.cpp）
+	//         → 矿车完全不动：NextMission() 会把刚设的 MissionStatus 冲掉
 	UnitClass* const pUnit = abstract_cast<UnitClass*>(pFoot);
 
 	if (!pUnit)
 		return Continue;
 
-	pUnit->SetArchiveTarget(pTarget);   // 记住要进哪座
 	pUnit->SetTarget(nullptr);
 	pUnit->SetDestination(pTarget, true);
 	pUnit->QueueMission(Mission::Move, false);

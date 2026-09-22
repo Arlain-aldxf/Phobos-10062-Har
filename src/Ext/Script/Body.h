@@ -238,6 +238,10 @@ public:
 	static void Mission_Move_List1Random(TeamClass* pTeam, int calcThreatMode = 0, bool pickAllies = false, int attackAITargetType = -1, int idxAITargetTypeItem = -1);
 	static void Mission_Move_List_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType);
 	static void Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pickAllies, int attackAITargetType, int idxAITargetTypeItem);
+
+	// 10062：判断某个小队此刻是否正停在这一行动作上
+	// （矿车找停靠建筑时用它来判定"这次出门是要去盟友家倒矿"）
+	static bool IsTeamRunningMoveEnterAction(TeamClass* pTeam);
 	static bool HandleTargetEntryTimeout(TeamClass* pTeam);
 	static bool IsTargetObjectEntrable(TechnoClass* pTarget);
 

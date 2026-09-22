@@ -234,6 +234,31 @@ void ScriptExt::ProcessAction(TeamClass* pTeam)
 		ScriptExt::VariablesHandler(pTeam, static_cast<PhobosScripts>(action), argument);
 }
 
+// 10062：小队此刻是否正停在这一行动作上。
+// 用途：矿车寻找停靠建筑时，据此判断"这次出门是要去盟友家倒矿"。
+bool ScriptExt::IsTeamRunningMoveEnterAction(TeamClass* pTeam)
+{
+	if (!pTeam)
+		return false;
+
+	const auto pScript = pTeam->CurrentScript;
+
+	if (!pScript || !pScript->Type)
+		return false;
+
+	const int currentMission = pScript->CurrentMission;
+
+	if (currentMission < 0)
+		return false;
+
+	const auto& actions = pScript->Type->ScriptActions;
+
+	if (currentMission >= static_cast<int>(actions.size()))
+		return false;
+
+	return actions[currentMission].Action == static_cast<int>(PhobosScripts::MoveToTypeFriendlyCloserEnter);
+}
+
 void ScriptExt::ExecuteTimedAreaGuardAction(TeamClass* pTeam)
 {
 	auto const pScript = pTeam->CurrentScript;

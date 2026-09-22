@@ -216,8 +216,14 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	R->ESI(pTarget);
 
 	// ---- ② 真的开过去：照抄 10062 主流程（测试 02 已验证走通）----
+	//
+	// ⚠️ 这里必须用 `auto const`，不能写成 `const CellClass* const`：
+	//    auto const 只加【底层】const（const CellClass*），顶层 const 被丢弃 → 得到 CellClass*；
+	//    显式写 `const CellClass* const` 会把【顶层】const 也带上，
+	//    于是 SetDestination(AbstractClass*, bool) 报 C2664：无法从 const CellClass* 转换。
+	//    Mission.Move.cpp 用的就是 auto const，保持完全一致。
 	const CoordStruct coord = TechnoExt::PassengerKickOutLocation(pTarget, pFoot, 10);
-	const CellClass* const pDestination = MapClass::Instance.TryGetCellAt(
+	auto const pDestination = MapClass::Instance.TryGetCellAt(
 		coord != CoordStruct::Empty ? coord : pTarget->Location);
 
 	// 落点找不到 → 不要乱动，交给引擎下帧再试

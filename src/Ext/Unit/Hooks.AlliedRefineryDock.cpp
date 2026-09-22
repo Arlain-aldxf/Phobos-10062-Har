@@ -13,6 +13,8 @@
 
 #include <Utilities/Macro.h>
 
+#include <cstdio>   // 诊断用的状态记录
+
 // ============================================================================
 // 10062 配套：让"给盟友倒矿"的矿车，把落点换成盟友的精炼厂
 //
@@ -210,6 +212,52 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 
 	if (!pTarget)
 		return Continue;
+
+	// ---- 状态变化记录（诊断用；只在任务/状态改变时写一行）----
+	// 目的：看清矿车从"移动 → 进入 → 倒矿"到底走到哪一步、卡在哪。
+	{
+		static FILE* s_log = nullptr;
+		static DWORD s_lastKey = 0xFFFFFFFF;
+		static int   s_lines = 0;
+
+		const DWORD curMission = static_cast<DWORD>(pFoot->GetCurrentMission());
+		const DWORD curStatus  = static_cast<DWORD>(pFoot->MissionStatus);
+		const DWORD linked     = (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget) ? 1 : 0;
+		const DWORD key = (curMission << 20) ^ (curStatus << 8) ^ linked;
+
+		if (key != s_lastKey && s_lines < 80)
+		{
+			s_lastKey = key;
+			++s_lines;
+
+			if (!s_log)
+			{
+				s_log = fopen("D:\\Ra2 project\\2-开发环境\\Mod工作副本\\probe10062.log", "w");
+
+				if (!s_log)
+					s_log = fopen("probe10062.log", "w");
+
+				if (s_log)
+				{
+					fprintf(s_log, "=== 10062 docking trace ===\n");
+					fflush(s_log);
+				}
+			}
+
+			if (s_log)
+			{
+				fprintf(s_log,
+					"#%-3d mission=%-3u status=%-3u storage=%.3f archiveTarget=%p linkedToTarget=%u\n",
+					s_lines,
+					static_cast<unsigned>(curMission),
+					static_cast<unsigned>(curStatus),
+					pFoot->GetStoragePercentage(),
+					pFoot->ArchiveTarget,
+					static_cast<unsigned>(linked));
+				fflush(s_log);
+			}
+		}
+	}
 
 	// ---- ① 防崩：把 ESI 换成合法建筑 ----
 	// 引擎紧接着会把它当"建筑"解引用；不给它一个真的就会崩在 0x73EB9F。

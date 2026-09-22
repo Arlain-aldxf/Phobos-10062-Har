@@ -126,9 +126,17 @@ namespace AlliedRefineryDock
 }
 
 // 紧跟"挑建筑的虚函数"之后：EAX = 它挑中的建筑，我们按条件换成盟友的
+//
+// ⚠️ 两个必须守住的细节（第一版就在这里崩了）：
+//   ① 钩点必须"跳过 test bl,bl"、返回 0x73EB88 —— 让引擎自己执行那条 test，
+//      这样紧接着的 `jne 0x73EDC0` 读到的是它该有的标志位。
+//      第一版钩在 0x73EB84（把 test 吃掉了），jne 读到的是我 C++ 代码留下的
+//      垃圾标志位 → 走错分支 → 在 0x73EB9F 拿错指针调虚函数 → 崩溃。
+//   ② 改写 ESI（不是 EAX）：这里引擎直接用 ESI 当目标（0x73EB96 `mov edx,[esi]`、
+//      0x73EB9D `mov ecx,esi`），EAX 在这条路上已经被用掉了。
 DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 {
-	enum { Continue = 0x73EB86 };
+	enum { Continue = 0x73EB88 }; // → 让引擎自己执行 test bl,bl
 
 	GET(FootClass* const, pFoot, EBP);
 
@@ -137,8 +145,7 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (!pTarget)
 		return Continue;
 
-	// 改答案：EAX 随后会被 `mov esi,eax` 存起来，成为这次"回厂"的目标
-	R->EAX(pTarget);
+	R->ESI(pTarget);
 
 	return Continue;
 }

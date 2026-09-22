@@ -236,6 +236,20 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
 		return Continue;
 
+	// ⚠️⚠️ 第二条守卫（实测教训，很关键）：
+	//    目标一旦已经确定（ArchiveTarget 就是这座盟友精炼厂），就**彻底停止插手**，
+	//    让引擎自己走完"走到 → 对接 → 倒矿"。
+	//
+	//    为什么需要：矿车开到停机坪时往往还处于 Move 状态，上面那条
+	//    "Enter/Unload 就不打扰"覆盖不到它。若此时仍每帧重下
+	//    SetDestination + Move + Enter，引擎"准备对接"的过程会被反复重置 ——
+	//    表现为【矿车站在矿上却不倒矿】（实测：9bea8ae+守卫版就是这个现象）。
+	//
+	//    Mission.Move.cpp 的注释也是这个意思："Only re-issue while the harvester
+	//    is still on its way there."
+	if (pFoot->ArchiveTarget == pTarget)
+		return Continue;
+
 	// ⚠️ 这里必须用 `auto const`，不能写成 `const CellClass* const`：
 	//    auto const 只加【底层】const（const CellClass*），顶层 const 被丢弃 → 得到 CellClass*；
 	//    显式写 `const CellClass* const` 会把【顶层】const 也带上，

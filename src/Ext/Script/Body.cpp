@@ -251,12 +251,9 @@ bool ScriptExt::IsTeamRunningMoveEnterAction(TeamClass* pTeam)
 	if (currentMission < 0)
 		return false;
 
-	const auto& actions = pScript->Type->ScriptActions;
-
-	if (currentMission >= static_cast<int>(actions.size()))
-		return false;
-
-	return actions[currentMission].Action == static_cast<int>(PhobosScripts::MoveToTypeFriendlyCloserEnter);
+	// ScriptActions 是定长数组（不支持 .size()），下标由引擎保证在范围内
+	return pScript->Type->ScriptActions[currentMission].Action
+		== static_cast<int>(PhobosScripts::MoveToTypeFriendlyCloserEnter);
 }
 
 void ScriptExt::ExecuteTimedAreaGuardAction(TeamClass* pTeam)

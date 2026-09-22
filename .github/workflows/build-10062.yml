@@ -1,10 +1,11 @@
-name: build-10062
+﻿name: build-10062
 
 on:
   workflow_dispatch:
   push:
     branches:
       - 'action-10062*'
+      - 'fix-10062-archivetarget'
 
 env:
   SOLUTION_FILE_PATH: .

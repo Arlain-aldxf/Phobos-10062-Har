@@ -1,0 +1,83 @@
+name: build-log-10062
+
+# 目的：build-10062 失败时，把 MSBuild 的完整输出当【产物】传上来。
+# 为什么不用 GitHub 的日志接口：下载 run logs 需要 admin 权限（403），
+# 但 artifact 是公开可下的 —— 所以把日志本身做成 artifact。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'fix-10062-archivetarget'
+      - 'probe-log-10062'
+      - 'action-10062*'
+
+env:
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: DevBuild
+
+jobs:
+  buildlog:
+    runs-on: windows-latest
+
+    steps:
+    - name: checkout (with submodules)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: strip the ATL include from YRpp
+      shell: pwsh
+      run: |
+        $f = 'YRpp\Interfaces.h'
+        $text = [IO.File]::ReadAllText($f)
+        $text = $text -replace '(?m)^\s*#include\s*<atlbase\.h>\s*\r?\n', ''
+        [IO.File]::WriteAllText($f, $text)
+        Write-Host 'ATL include removed'
+
+    - name: build phobos (capture log)
+      shell: pwsh
+      run: |
+        # 找出解决方案文件
+        $sln = Get-ChildItem -Recurse -Filter '*.sln' | Select-Object -First 1
+        Write-Host "solution: $($sln.FullName)"
+
+        # 找 msbuild
+        $msbuild = (Get-Command msbuild -ErrorAction SilentlyContinue).Source
+        if (-not $msbuild) {
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+        }
+        Write-Host "msbuild: $msbuild"
+
+        # 编译，把输出同时写进文件
+        & $msbuild $sln.FullName /p:Configuration=DevBuild /p:Platform=Win32 /m /v:normal 2>&1 |
+          Tee-Object -FilePath buildlog.txt
+        $code = $LASTEXITCODE
+        Write-Host "msbuild exit code = $code"
+        "EXITCODE=$code" | Add-Content buildlog.txt
+
+        # 失败也不让这一步直接挂掉，保证下面的上传能执行
+        exit 0
+
+    - name: extract compiler errors
+      shell: pwsh
+      run: |
+        Write-Host '===== 只挑错误行 ====='
+        $errs = Select-String -Path buildlog.txt -Pattern 'error [A-Z]+\d+|错误|: error' -ErrorAction SilentlyContinue
+        if ($errs) {
+          $errs | ForEach-Object { Write-Host $_.Line }
+          $errs | ForEach-Object { $_.Line } | Set-Content compiler-errors.txt -Encoding utf8
+        } else {
+          Write-Host '(没有匹配到 error 行，请看 buildlog.txt 全文)'
+        }
+
+    - name: upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: buildlog
+        path: |
+          buildlog.txt
+          compiler-errors.txt
+        if-no-files-found: warn

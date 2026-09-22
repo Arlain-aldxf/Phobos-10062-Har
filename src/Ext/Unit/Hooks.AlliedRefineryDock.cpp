@@ -14,39 +14,40 @@
 #include <Utilities/Macro.h>
 
 // ============================================================================
-// 10062 配套：让"正在给盟友倒矿"的矿车，把停靠目标换成盟友的精炼厂
+// 10062 配套：让"给盟友倒矿"的矿车，把落点换成盟友的精炼厂
 //
-// 背景
-//   引擎里决定"回哪座精炼厂"的是 FootClass::Find_Dock（0x4DEE80）。
-//   它按"所属方"过滤候选建筑（0x4DEEFA: cmp eax, edx / jne），所以矿车装满后
-//   只找自家的精炼厂 —— 这就是 10062 交了目标却仍然回家的原因。
+// 【真正的钩点】Harvest 任务里"挑一个可用建筑"的那次虚函数调用
 //
-// 关键：Find_Dock 有两条出口，都要照顾
-//   出口 A（正常走完循环）：
-//       0x4DF021  mov eax,[esp+0x14]   ; 把"选中的建筑"装进 EAX（4 字节）
-//       0x4DF025  5B  pop ebx          ; 1 字节  <<< 钩点 A（长度 1、返回 0x4DF026）
-//   出口 B（提前放弃，EAX = EDI，而循环没跑过 → 返回空）：
-//       0x4DEEAC  je  0x4DF02F         ; 6 字节  <<< 钩点 B1
-//       0x4DEEC3  jle 0x4DF02F         ; 6 字节  <<< 钩点 B2
-//   出口 B 就是"场上没有自家精炼厂"时走的路 —— 车会原地不动。
+//   0073EB55  call 0x4DF0D0            ; 清空 [this+0x5A0] / [this+0x5A4]
+//   0073EB5A  mov  eax,[ebp+0x5A4]     ; 读回 ArchiveTarget
+//   0073EB60  test eax,eax
+//   0073EB62  jne  0x73EF77            ; 已有目标 → 跳过（"回自家"走的就是这条）
+//   0073EB68  ...                      ; 没有目标 → 继续往下挑
+//   0073EB7E  call dword ptr [eax+0x528]   ; ★★ 挑建筑的虚函数调用（返回值在 EAX）
+//   0073EB84  test bl,bl               ; 2 字节  <<< 钩这里
+//   0073EB86  mov  esi,eax             ; 2 字节  <<< 返回这里：EAX 会被存进 esi
+//   0073EB88  jne  0x73EDC0
+//   0073EB8E  test esi,esi
+//   0073EB90  je   0x73EC1F
 //
-// 做法
-//   两条出口都不改引擎的搜索逻辑，只在它给出答案之后改答案。
-//   由于出口 B 的 EAX 来自 EDI（此时无效），必须连"结果栈槽" [esp+0x14] 一起写，
-//   两条出口都是从这个槽取最终结果的。
+//   ebp = 这辆载具（调用点前一条是 `mov ecx,ebp`，把 this 传给虚函数）
+//
+// 早期版本的错误（记录以免重犯）：
+//   曾把钩子挂在 FootClass::Find_Dock（0x4DEE80）的两条出口上 —— 但那个函数
+//   在整份 gamemd.exe 里没有任何 call（只有 4 处虚表引用），根本不在这条路上，
+//   所以"毫无反应"。
 //
 // 生效条件（四个全满足才动手，缺一即完全放行）
 //   ① 是矿车（UnitTypeClass::Harvester）
 //   ② 满载（GetStoragePercentage() >= 0.999）
-//   ③ 所属小队此刻正停在 10062 这一行（ScriptExt::IsTeamRunningMoveEnterAction）
-//   ④ 在场上找得到"盟友的、不是自家的、可达的"精炼厂
-//
-// 因此：其它矿车、其它阵营、其它脚本动作 —— 一律不受影响。
+//   ③ 所属小队的脚本里启用了 10062（ScriptExt::IsTeamUsingMoveEnterAction）
+//      —— 注意不是"此刻正停在这一行"：矿车满载时小队往往已在后续行上
+//   ④ 场上找得到"盟友的、不是自家的、可达的"精炼厂
 // ============================================================================
 
 namespace AlliedRefineryDock
 {
-	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿
+	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿、必须开得进去
 	static BuildingClass* FindNearestAlliedRefinery(FootClass* pFoot)
 	{
 		BuildingClass* pBest = nullptr;
@@ -103,7 +104,7 @@ namespace AlliedRefineryDock
 		if (!pFoot)
 			return nullptr;
 
-		// ① 是矿车（FootClass 无 Type，要用 GetTechnoType()；
+		// ① 是矿车（FootClass 无 Type，用 GetTechnoType()；
 		//    Harvester 在 UnitTypeClass 上，需转型）
 		TechnoTypeClass* const pFootType = pFoot->GetTechnoType();
 		UnitTypeClass* const pUnitType = abstract_cast<UnitTypeClass*>(pFootType);
@@ -115,65 +116,29 @@ namespace AlliedRefineryDock
 		if (pFoot->GetStoragePercentage() < 0.999)
 			return nullptr;
 
-		// ③ 所属小队正在执行 10062
-		if (!ScriptExt::IsTeamRunningMoveEnterAction(pFoot->Team))
+		// ③ 所属小队的脚本启用了 10062
+		if (!ScriptExt::IsTeamUsingMoveEnterAction(pFoot->Team))
 			return nullptr;
 
-		// ④ 找得到盟友精炼厂
+		// ④ 找到盟友精炼厂
 		return FindNearestAlliedRefinery(pFoot);
 	}
 }
 
-// ---- 出口 A：循环走完，EAX 刚刚被写入（0x4DF021 之后）------------------------
-//   004DF021  8B 44 24 14   mov  eax,[esp+0x14]
-//   004DF025  5B            pop  ebx          <<< 钩这里（长度 1，返回 0x4DF026）
-// 读 ESI（this，函数头 mov esi,ecx），刻意不读 EDI（循环里会被覆写）。
-DEFINE_HOOK(0x4DF025, FootClass_FindDock_PreferAlliedRefinery_Main, 0x1)
+// 紧跟"挑建筑的虚函数"之后：EAX = 它挑中的建筑，我们按条件换成盟友的
+DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 {
-	enum { Continue = 0x4DF026 };
+	enum { Continue = 0x73EB86 };
 
-	GET(FootClass* const, pFoot, ESI);
+	GET(FootClass* const, pFoot, EBP);
 
 	BuildingClass* const pTarget = AlliedRefineryDock::GetRedirectTarget(pFoot);
 
 	if (!pTarget)
 		return Continue;
 
+	// 改答案：EAX 随后会被 `mov esi,eax` 存起来，成为这次"回厂"的目标
 	R->EAX(pTarget);
 
 	return Continue;
-}
-
-// ---- 出口 B：提前放弃（场上没有自家精炼厂时走这里）--------------------------
-// 0x4DEEAC / 0x4DEEC3 都是 6 字节、都跳向出口 B 的 0x4DF02F。
-// 这里不跳转、原地返回 —— 让函数继续跑它自己的出口，避免"跳到哪"出错。
-DEFINE_HOOK(0x4DEEAC, FootClass_FindDock_PreferAlliedRefinery_Early1, 0x6)
-{
-	GET(FootClass* const, pFoot, ESI);
-
-	BuildingClass* const pTarget = AlliedRefineryDock::GetRedirectTarget(pFoot);
-
-	if (pTarget)
-	{
-		// 出口 B 的返回值取自 [esp+0x14]，必须连它一起写
-		R->Stack(STACK_OFFSET(0x14, 0), pTarget);
-		R->EAX(pTarget);
-	}
-
-	return 0;
-}
-
-DEFINE_HOOK(0x4DEEC3, FootClass_FindDock_PreferAlliedRefinery_Early2, 0x6)
-{
-	GET(FootClass* const, pFoot, ESI);
-
-	BuildingClass* const pTarget = AlliedRefineryDock::GetRedirectTarget(pFoot);
-
-	if (pTarget)
-	{
-		R->Stack(STACK_OFFSET(0x14, 0), pTarget);
-		R->EAX(pTarget);
-	}
-
-	return 0;
 }

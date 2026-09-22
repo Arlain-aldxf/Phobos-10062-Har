@@ -234,9 +234,13 @@ void ScriptExt::ProcessAction(TeamClass* pTeam)
 		ScriptExt::VariablesHandler(pTeam, static_cast<PhobosScripts>(action), argument);
 }
 
-// 10062：小队此刻是否正停在这一行动作上。
-// 用途：矿车寻找停靠建筑时，据此判断"这次出门是要去盟友家倒矿"。
-bool ScriptExt::IsTeamRunningMoveEnterAction(TeamClass* pTeam)
+// 10062：这支小队的脚本里是否启用了"移动到友方目标并进入"这一动作。
+//
+// 用途：矿车寻找停靠建筑时，据此判断"这支小队是走 10062 的"。
+// 注意：不能只判断"当前正停在这一行"——矿车满载那一刻，小队往往已经
+// 走到后面的行（采矿/警戒等），那样条件会为假，动作就失效了。
+// 这里改为扫描整份脚本：只要脚本里出现过 10062，就认为这支小队适用。
+bool ScriptExt::IsTeamUsingMoveEnterAction(TeamClass* pTeam)
 {
 	if (!pTeam)
 		return false;
@@ -246,14 +250,23 @@ bool ScriptExt::IsTeamRunningMoveEnterAction(TeamClass* pTeam)
 	if (!pScript || !pScript->Type)
 		return false;
 
-	const int currentMission = pScript->CurrentMission;
+	const auto& actions = pScript->Type->ScriptActions;
+	const int target = static_cast<int>(PhobosScripts::MoveToTypeFriendlyCloserEnter);
 
-	if (currentMission < 0)
-		return false;
+	// ScriptActions 是定长数组（不支持 .size()），逐行扫描、越界前退出
+	for (int i = 0; i < 50; ++i)
+	{
+		const int action = actions[i].Action;
 
-	// ScriptActions 是定长数组（不支持 .size()），下标由引擎保证在范围内
-	return pScript->Type->ScriptActions[currentMission].Action
-		== static_cast<int>(PhobosScripts::MoveToTypeFriendlyCloserEnter);
+		if (action == target)
+			return true;
+
+		// 0 = 脚本结束（不存在的行按 0 处理）
+		if (action == 0)
+			break;
+	}
+
+	return false;
 }
 
 void ScriptExt::ExecuteTimedAreaGuardAction(TeamClass* pTeam)

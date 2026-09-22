@@ -155,49 +155,50 @@ namespace AlliedRefineryDock
 }
 
 // ---------------------------------------------------------------------------
-// 钩点：0x73EB84 —— 不改任何寄存器，只把引擎"缺的那个目的地"填上
+// 钩点：0x73EB84 —— 最终方案 = 【防崩】+【真的开过去】，两者缺一不可
 //
-// 【为什么不改寄存器】（实测结果，2026-09-22 夜）
+// 【一、写 ESI 是为了防崩（这是硬需求，不是猜的）】
 //
-//   | 版本    | 写了什么  | 结果                     |
-//   |---------|-----------|--------------------------|
-//   | 3cae517 | 只写 EAX  | 不崩，但矿车【不动】     |
-//   | ed7a6f5 | 只写 ESI  | 【不崩】，但矿车【停下】 |
+//   引擎在 0x73EB7E 调 `[eax+0x528]` 挑建筑。**在"长征方没有任何自家精炼厂"
+//   这个场景下它找不到可回的建筑，返回的不是建筑指针，而是一个内部字段地址**
+//   —— 崩溃时实测 esi = ebp + 0xC8，解引用出来是 0x651 这种垃圾值。
 //
-//   结论：**只写 ESI【不会崩】，但也【不生效】**。
-//   → 引擎判断该回哪座矿场，【不看这个寄存器，看的是 TechnoClass::ArchiveTarget 字段】。
+//   而接下来三条支路**全都**要 ESI 装"建筑"：
+//     · BL=0  → 0x73EB86 mov esi,eax → 0x73EB8E test esi,esi → 0x73EB96 mov edx,[esi]
+//     · BL≠0  → 0x73EB88 jne 0x73EDC0 → 0x73EDC8 mov eax,[esi]
+//     · 挑不到 → 0x73EB90 je 0x73EC1F（只有这条会自己重新 mov esi,eax）
+//   → ESI 是垃圾就崩在 0x73EB9F（实测两次都是这里，且与"改不改寄存器"无关：
+//     连"一个寄存器都不碰"的版本也崩在同一个地址）。
+//   → **把 ESI 换成合法建筑，崩溃就消失**（实测：只写 ESI 那版全程不崩）。
 //
-//   ⚠️ 更正（重要，别再被误导）：曾一度以为"同时写 ESI+EAX 会崩"，并把原因归给 EAX。
-//      实际核查后是**探针自己引入的崩溃**：那个诊断用的入口钩子挂在 0x73EB32，
-//      吃掉了 `test ecx,ecx` 却没恢复标志位，导致紧随其后的 `je 0x73EB5A`
-//      读到 C++ 留下的垃圾标志位 → 走错分支 → 崩在 0x4DF07A（与 Harvest 无关的
-//      一个通用容器操作里）。
-//      **教训（同一个坑摔了两次）**：钩掉一条"设标志位"的指令（`test`/`cmp`）后，
-//      必须在钩子里自己把那条指令重做一遍，否则后续的条件跳转读到的是垃圾标志位。
+// 【二、还要自己下达指令，是为了真的开过去】
 //
-// 【引擎真实的逻辑】（反汇编 0x73EB2C 起）
+//   只写 ESI 那版**不崩、但矿车也不动**：引擎只是拿 ESI 去算距离/优先级，
+//   并不会因此主动开过去。**目的地必须显式下达。**
 //
-//   0073EB2C  mov  ecx,[ebp+0x5A4]    ; ← ArchiveTarget
-//   0073EB32  test ecx,ecx
-//   0073EB34  je   0x73EB5A           ; 无目标 → 往下走
-//   ...
-//   0073EB5A  mov  eax,[ebp+0x5A4]    ; 再读一次
-//   0073EB60  test eax,eax
-//   0073EB62  jne  0x73EF77           ; 有目标 → 去执行"前往该目标"
+//   所以照抄 Mission.Move.cpp 里 10062 主流程、**已在测试 02 走通过**的写法：
+//     SetArchiveTarget(pTarget)         ← 告诉引擎"我要进这个建筑"
+//     SetTarget(nullptr)                ← 清掉可能还指着矿田的目标
+//     QueueMission(Move) + SetDestination(目标旁落点)
+//     QueueMission(Enter)               ← 再"进入"
+//   落点用 TechnoExt::PassengerKickOutLocation（与 10062 主流程完全一致）。
 //
-//   所以：**只要在它读之前把 ArchiveTarget 填好，引擎就会自己走完整条路**
-//   —— 不需要我们碰任何寄存器、任何分支。
+// 【走过弯路的记录（别再重走）】
+//   · 钩 FootClass::Find_Dock（0x4DEE80）出口 —— 那函数全 exe 无 call，不在路上。
+//   · 只在"该写 EAX 还是 ESI"之间来回换 —— 都不是关键，关键见上面两条。
+//   · 曾以为"同时写 ESI+EAX 会崩" —— 其实是探针自己崩的：诊断用的入口钩子挂在
+//     0x73EB32，吃掉了 `test ecx,ecx` 却没恢复标志位，导致紧随的 `je 0x73EB5A`
+//     读到 C++ 留下的垃圾标志位 → 走错分支 → 崩在 0x4DF07A（与 Harvest 无关的
+//     通用容器操作里）。
+//     **教训（同一个坑摔了两次）**：钩掉一条"设标志位"的指令（`test`/`cmp`）后，
+//     必须在钩子里把那条指令重做一遍，否则后续条件跳转读到的是垃圾标志位。
 //
-//   而 ArchiveTarget 正是 SetArchiveTarget() 写的字段（JMP_THIS(0x70C610)），
-//   也就是引擎自己在 0x73EAF2 / 0x73EA7B 调用的那个函数。
-//
-// 【本版做法】
-//   满载 + 小队用 10062 + 找得到盟友精炼厂 → 把 ArchiveTarget 指向它，
-//   然后原样返回（一个寄存器都不碰）。
-//   下一帧引擎执行到 0x73EB34 时就会发现"有目标了"，自己前往。
-//
-//   同时清掉当前 SetTarget（可能还指着矿田），让引擎干净地重新决策。
-//   找不到目标时不改任何东西，完全退回原版行为。
+// 生效条件（四个全满足才动手，缺一即完全放行、退回原版行为）
+//   ① 是矿车（UnitTypeClass::Harvester）
+//   ② 满载（GetStoragePercentage() >= 0.999）
+//   ③ 所属小队的脚本里启用了 10062（ScriptExt::IsTeamUsingMoveEnterAction）
+//      —— 不是"此刻正停在这一行"：矿车满载时小队往往已在后续行上
+//   ④ 场上找得到"盟友的、不是自家的、可达的"精炼厂
 // ---------------------------------------------------------------------------
 DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 {
@@ -210,9 +211,28 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (!pTarget)
 		return Continue;
 
-	// 只写字段，不碰寄存器
-	pFoot->ArchiveTarget = pTarget;
+	// ---- ① 防崩：把 ESI 换成合法建筑 ----
+	// 引擎紧接着会把它当"建筑"解引用；不给它一个真的就会崩在 0x73EB9F。
+	R->ESI(pTarget);
+
+	// ---- ② 真的开过去：照抄 10062 主流程（测试 02 已验证走通）----
+	const CoordStruct coord = TechnoExt::PassengerKickOutLocation(pTarget, pFoot, 10);
+	const CellClass* const pDestination = MapClass::Instance.TryGetCellAt(
+		coord != CoordStruct::Empty ? coord : pTarget->Location);
+
+	// 落点找不到 → 不要乱动，交给引擎下帧再试
+	if (!pDestination)
+		return Continue;
+
+	// 落点此刻被占（精炼厂停机位常是满的）→ 同理，不硬闯
+	if (pFoot->Locomotor->Can_Enter_Cell(pDestination->MapCoords) != Move::OK)
+		return Continue;
+
+	pFoot->SetArchiveTarget(pTarget);
 	pFoot->SetTarget(nullptr);
+	pFoot->QueueMission(Mission::Move, false);
+	pFoot->SetDestination(pDestination, true);
+	pFoot->QueueMission(Mission::Enter, false);
 
 	return Continue;
 }

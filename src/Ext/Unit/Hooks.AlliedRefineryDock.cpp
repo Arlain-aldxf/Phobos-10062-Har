@@ -2,9 +2,10 @@
 #include <FootClass.h>
 #include <BuildingClass.h>
 #include <HouseClass.h>
+#include <TechnoClass.h>
+#include <TechnoTypeClass.h>
 #include <MapClass.h>
 #include <CellClass.h>
-#include <TechnoClass.h>
 
 #include <Ext/Script/Body.h>
 #include <Ext/Techno/Body.h>
@@ -47,8 +48,13 @@ DEFINE_HOOK(0x4DF025, FootClass_FindDock_PreferAlliedRefinery, 0x1)
 
 	GET(FootClass* const, pFoot, ESI);
 
-	// ① 是矿车
-	if (!pFoot || !pFoot->Type || !pFoot->Type->Harvester)
+	// ① 是矿车（FootClass 上要用 GetTechnoType()，Type 是 ObjectClass 层的基类指针）
+	if (!pFoot)
+		return Continue;
+
+	const TechnoTypeClass* const pFootType = pFoot->GetTechnoType();
+
+	if (!pFootType || !pFootType->Harvester)
 		return Continue;
 
 	// ② 满载

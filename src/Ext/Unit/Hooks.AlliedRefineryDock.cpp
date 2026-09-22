@@ -1,4 +1,5 @@
 #include <UnitClass.h>
+#include <UnitTypeClass.h>
 #include <FootClass.h>
 #include <BuildingClass.h>
 #include <HouseClass.h>
@@ -48,13 +49,16 @@ DEFINE_HOOK(0x4DF025, FootClass_FindDock_PreferAlliedRefinery, 0x1)
 
 	GET(FootClass* const, pFoot, ESI);
 
-	// ① 是矿车（FootClass 上要用 GetTechnoType()，Type 是 ObjectClass 层的基类指针）
 	if (!pFoot)
 		return Continue;
 
-	const TechnoTypeClass* const pFootType = pFoot->GetTechnoType();
+	// ① 是矿车
+	//    FootClass 上没有 Type（要用 GetTechnoType()），
+	//    Harvester 也不在 TechnoTypeClass 上，而在 UnitTypeClass 上。
+	TechnoTypeClass* const pFootType = pFoot->GetTechnoType();
+	UnitTypeClass* const pUnitType = abstract_cast<UnitTypeClass*>(pFootType);
 
-	if (!pFootType || !pFootType->Harvester)
+	if (!pUnitType || !pUnitType->Harvester)
 		return Continue;
 
 	// ② 满载

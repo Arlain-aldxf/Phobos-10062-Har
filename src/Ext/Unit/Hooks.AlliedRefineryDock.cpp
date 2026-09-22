@@ -217,6 +217,25 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 
 	// ---- ② 真的开过去：照抄 10062 主流程（测试 02 已验证走通）----
 	//
+	// ⚠️⚠️ 关键守卫（漏了会出事，实测教训）：
+	//    这个钩子**每一帧都会被调用**。如果每帧都重新下达 Move/Enter，
+	//    矿车刚要对接就被指令重置 → 永远进不了门 → 表现为"在矿场旁边疯狂抖动/
+	//    反复移动"（盟军超时空矿车会留下一串传送残影，苏军矿车原地来回蹭）。
+	//
+	//    Mission.Move.cpp 里 10062 主流程早就有这个守卫，原话：
+	//      "The Enter order stays active (and keeps retrying on its own) until the
+	//       object is actually entered, so it must not be re-issued every frame.
+	//       Only re-issue while the harvester is still on its way there."
+	//    照抄它：Enter / Unload 进行中 → 什么都别做，让引擎自己走完。
+	const auto currentMission = pFoot->GetCurrentMission();
+
+	if (currentMission == Mission::Enter || currentMission == Mission::Unload)
+		return Continue;
+
+	// 已经挂上目标（正在倒矿）→ 更不要打扰
+	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
+		return Continue;
+
 	// ⚠️ 这里必须用 `auto const`，不能写成 `const CellClass* const`：
 	//    auto const 只加【底层】const（const CellClass*），顶层 const 被丢弃 → 得到 CellClass*；
 	//    显式写 `const CellClass* const` 会把【顶层】const 也带上，

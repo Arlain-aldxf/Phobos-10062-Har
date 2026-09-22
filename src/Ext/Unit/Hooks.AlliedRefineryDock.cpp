@@ -34,9 +34,16 @@
 // 因此：其它矿车、其它阵营、其它脚本动作 —— 一律不受影响。
 // ============================================================================
 
-DEFINE_HOOK(0x4DF02C, FootClass_FindDock_PreferAlliedRefinery, 0x3)
+// 钩点选在 `pop ebx`（1 字节指令 5B），实测字节：
+//   004DF021  8B 44 24 14   mov  eax,[esp+0x14]   ; 4 字节（把"选中的建筑"放进 EAX）
+//   004DF025  5B            pop  ebx              ; 1 字节  <<< 钩这里（长度 1、返回 0x4DF026）
+//   004DF026  5F / 027 5E / 028 5D / 029 83 C4 2C / 02C C2 10 00   ; 原样交给引擎
+// 为什么读 ESI：函数头 `mov esi,ecx`（0x4DEE89），ESI 全程是 this（Phobos 官方
+//   多处钩子也是这么取的）。刻意不读 EDI —— 循环里它会被覆写，不保险。
+// 刻意不钩 `ret 0x10` —— 那条指令被搬进跳板后返回地址会错位。
+DEFINE_HOOK(0x4DF025, FootClass_FindDock_PreferAlliedRefinery, 0x1)
 {
-	enum { Continue = 0x4DF02F };
+	enum { Continue = 0x4DF026 };
 
 	GET(FootClass* const, pFoot, ESI);
 
@@ -98,6 +105,9 @@ DEFINE_HOOK(0x4DF02C, FootClass_FindDock_PreferAlliedRefinery, 0x3)
 		return Continue;
 
 	// 改答案：让矿车去盟友的精炼厂倒矿（钱进精炼厂所属方 = 盟友）
+	// 说明：函数在 0x4DF021 才把 [esp+0x14] 装进 EAX，而我们的钩点（0x4DF025）
+	// 在它之后 —— 此刻 EAX 就是即将返回的值，直接改写即可。
+	// 若实测发现"改了 EAX 却没生效"，再考虑同时写 [esp+0x14]。
 	R->EAX(pBest);
 
 	return Continue;

@@ -215,56 +215,56 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	// 引擎紧接着会把它当"建筑"解引用；不给它一个真的就会崩在 0x73EB9F。
 	R->ESI(pTarget);
 
-	// ---- ② 真的开过去：照抄 10062 主流程（测试 02 已验证走通）----
+	// ⚠️⚠️ 守卫：目标已经定好了就【彻底停止插手】
 	//
-	// ⚠️⚠️ 关键守卫（漏了会出事，实测教训）：
-	//    这个钩子**每一帧都会被调用**。如果每帧都重新下达 Move/Enter，
-	//    矿车刚要对接就被指令重置 → 永远进不了门 → 表现为"在矿场旁边疯狂抖动/
-	//    反复移动"（盟军超时空矿车会留下一串传送残影，苏军矿车原地来回蹭）。
+	//    这个钩子**每一帧都会被调用**（矿车满载期间引擎一直在跑 Harvest 任务），
+	//    而钩点 0x73EB84 本身就位于 Harvest 任务内部 ——
+	//    所以 currentMission 永远是 Harvest，"Enter/Unload 就不打扰"这种判断
+	//    在这里根本用不上（实测教训）。
 	//
-	//    Mission.Move.cpp 里 10062 主流程早就有这个守卫，原话：
-	//      "The Enter order stays active (and keeps retrying on its own) until the
-	//       object is actually entered, so it must not be re-issued every frame.
-	//       Only re-issue while the harvester is still on its way there."
-	//    照抄它：Enter / Unload 进行中 → 什么都别做，让引擎自己走完。
-	const auto currentMission = pFoot->GetCurrentMission();
-
-	if (currentMission == Mission::Enter || currentMission == Mission::Unload)
-		return Continue;
-
-	// 已经挂上目标（正在倒矿）→ 更不要打扰
-	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
-		return Continue;
-
-	// ⚠️⚠️ 第二条守卫（实测教训，很关键）：
-	//    目标一旦已经确定（ArchiveTarget 就是这座盟友精炼厂），就**彻底停止插手**，
-	//    让引擎自己走完"走到 → 对接 → 倒矿"。
+	//    真正该判断的是：**这辆矿车是不是已经在去这个目标的路上了**。
+	//    若是，就让引擎自己走完"走到 → 对接 → 倒矿"，别再重下指令。
 	//
-	//    为什么需要：矿车开到停机坪时往往还处于 Move 状态，上面那条
-	//    "Enter/Unload 就不打扰"覆盖不到它。若此时仍每帧重下
-	//    SetDestination + Move + Enter，引擎"准备对接"的过程会被反复重置 ——
-	//    表现为【矿车站在矿上却不倒矿】（实测：9bea8ae+守卫版就是这个现象）。
+	//    反面教训（都实测过）：
+	//      · 每帧重下 Move/Enter → 矿车在矿场旁疯狂抖动、超时空矿车留下一串传送残影
+	//      · 不守卫而只重下 Move     → 矿车停在矿口不进（"准备对接"被反复重置）
 	//
 	//    Mission.Move.cpp 的注释也是这个意思："Only re-issue while the harvester
 	//    is still on its way there."
 	if (pFoot->ArchiveTarget == pTarget)
 		return Continue;
 
-	// ⚠️⚠️ 目的地必须用【建筑本身】，不能用 PassengerKickOutLocation
+	// 已经挂上目标（正在倒矿）→ 更不要打扰
+	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
+		return Continue;
+
+	// ⚠️⚠️ 关键：对矿车来说"回厂倒矿"不是 Mission::Enter，而是
+	//      **Mission::Harvest + MissionStatus = 2**（Status: returning to refinery）
 	//
-	//    PassageKickOutLocation 算的是"从这座建筑里被扔出来时落在哪"，也就是**旁边一格**。
-	//    用它当 Destination，矿车开到旁边那格就当成终点停下了 ——
-	//    表现为【占住矿口却不进门倒矿】（实测就是这个问题）。
+	//    实测教训（800957a / 2a1c0cc 两轮）：
+	//      用 Mission::Enter 时，矿车确实会移动到矿场、也会"进去"，
+	//      但**倒矿状态机不会启动** —— 表现为"卡在矿里不出来"，
+	//      而且停机位从此再也无法推进（后面的矿车在门口干等，空出位子也不进来）。
+	//      也就是说：引擎把"进门"和"倒矿"当成两件事，只给前者不够。
 	//
-	//    玩家右键点建筑下达"进入"时，引擎发的就是"目的地 = 建筑本身"，
-	//    由引擎自己去算该停到哪个停机位。
-	//
-	// 顺序也照玩家操作来：先 SetArchiveTarget（记住要进哪座），再 Move 过去，最后 Enter 进门。
-	pFoot->SetArchiveTarget(pTarget);
-	pFoot->SetTarget(nullptr);
-	pFoot->SetDestination(pTarget, true);
-	pFoot->QueueMission(Mission::Move, false);
-	pFoot->QueueMission(Mission::Enter, false);
+	//    写法直接照抄 Phobos 自己的 Hooks.Harvester.cpp（0x74312A
+	//    UnitClass_SetDestination_ReplaceWithHarvestMission）——那里明确写着
+	//    "Here change the Mission::Enter to Mission::Harvest"：
+	//        pThis->QueueMission(Mission::Harvest, false);
+	//        pThis->NextMission();
+	//        pThis->MissionStatus = 2;      // Status: returning to refinery
+	//        pThis->IsHarvesting = false;
+	UnitClass* const pUnit = abstract_cast<UnitClass*>(pFoot);
+
+	if (!pUnit)
+		return Continue;
+
+	pUnit->SetArchiveTarget(pTarget);      // 记住要进哪座（引擎会用它当回厂目标）
+	pUnit->SetTarget(nullptr);
+	pUnit->QueueMission(Mission::Harvest, false);
+	pUnit->NextMission();
+	pUnit->MissionStatus = 2;              // Status: returning to refinery
+	pUnit->IsHarvesting = false;
 
 	return Continue;
 }

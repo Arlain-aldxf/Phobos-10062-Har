@@ -213,6 +213,24 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (!pTarget)
 		return Continue;
 
+	// ---- ⓪ 防崩：把 ESI 换成合法建筑（必须无条件、且在任何守卫【之前】）----
+	//
+	// ⚠️⚠️⚠️ 这一行绝不能放到任何 return 之后 —— 这是实测踩出来的崩溃：
+	//
+	//   曾把 HasAnyLink() 守卫放到本行前面，结果：
+	//     对接成功那一帧 HasAnyLink() 为真 → 函数提前 return
+	//     → ESI 没被替换，仍是引擎返回的垃圾值（ebp+0xC8）
+	//     → 引擎拿它当建筑解引用 → 崩在 0x73EB9F
+	//     （状态记录仪当时只写了 3 行就断在那儿，正好对上）
+	//
+	//   引擎紧接着的执行路径三条都要 ESI 装"建筑"：
+	//     BL=0 → 0x73EB86 mov esi,eax → 0x73EB8E test esi,esi → 0x73EB96 mov edx,[esi]
+	//     BL≠0 → 0x73EB88 jne 0x73EDC0 → 0x73EDC8 mov eax,[esi]
+	//     挑不到 → 0x73EB90 je 0x73EC1F（只有这条会自己重新 mov esi,eax）
+	//   而"长征方没有自家精炼厂"时，[eax+0x528] 返回的不是建筑指针而是内部字段地址，
+	//   所以**每一次都必须替换**，不能有任何提前返回绕开它。
+	R->ESI(pTarget);
+
 	// ---- 状态变化记录（诊断用；只在任务/状态改变时写一行）----
 	// 目的：看清矿车从"移动 → 进入 → 倒矿"到底走到哪一步、卡在哪。
 	{
@@ -259,9 +277,11 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 		}
 	}
 
-	// ---- ① 已经对接上精炼厂了 → 立刻停手！----
+	// ---- ① 已经对接上精炼厂了 → 立刻停手（但 ESI 已经在上面替换过了）----
 	//
-	// ⚠️⚠️⚠️ 这条必须在【最前面】，而且必须早于任何写操作 —— 这是实测结论。
+	// ⚠️ 这条守卫可以放在这里，因为**防崩的 ESI 替换已经在最前面无条件做完了**。
+	//    曾经把它放在 ESI 替换之前 → 对接成功那一帧提前 return → ESI 仍是垃圾
+	//    → 崩在 0x73EB9F。保命操作必须在所有守卫之前。
 	//
 	// 状态记录仪抓到的真相（probe10062.log，两行一组交替出现）：
 	//     mission=10 status=2 archiveTarget=132ABD18  linkedToTarget=0
@@ -272,16 +292,8 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	// 即：**矿车确实跟精炼厂对接成功过（linkedToTarget=1），
 	//     但我们的钩子每帧重写目标，把对接状态反复打断** ——
 	//     永远在"对接成功 → 被打断 → 再对接"之间翻滚，倒矿自然完不成。
-	//
-	// 之前把 HasAnyLink() 检查排在 ArchiveTarget 检查【后面】是个错误：
-	// ArchiveTarget 一旦非空，函数在那行就 return 了，永远走不到 link 检查。
 	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
 		return Continue;
-
-	// ---- ② 防崩：把 ESI 换成合法建筑 ----
-	// 引擎紧接着会把它当"建筑"解引用；不给它一个真的就会崩在 0x73EB9F。
-	// （只写寄存器，不写任何字段 —— 见下面为什么不写 ArchiveTarget）
-	R->ESI(pTarget);
 
 	// ⚠️⚠️ 守卫：目标已经定好了就【彻底停手】
 	//

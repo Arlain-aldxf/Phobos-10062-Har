@@ -238,33 +238,34 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
 		return Continue;
 
-	// ⚠️⚠️ 关键：对矿车来说"回厂倒矿"不是 Mission::Enter，而是
-	//      **Mission::Harvest + MissionStatus = 2**（Status: returning to refinery）
+	// ⚠️⚠️ 这一段的每一行都是实测换来的，别随手改。三种写法的实测结果：
 	//
-	//    实测教训（800957a / 2a1c0cc 两轮）：
-	//      用 Mission::Enter 时，矿车确实会移动到矿场、也会"进去"，
-	//      但**倒矿状态机不会启动** —— 表现为"卡在矿里不出来"，
-	//      而且停机位从此再也无法推进（后面的矿车在门口干等，空出位子也不进来）。
-	//      也就是说：引擎把"进门"和"倒矿"当成两件事，只给前者不够。
+	//   (A) SetDestination(旁边那格) + Move + Enter
+	//       → 矿车【真的会移动】到盟友矿场，但停在门口不进（把旁边那格当成终点）
 	//
-	//    写法直接照抄 Phobos 自己的 Hooks.Harvester.cpp（0x74312A
-	//    UnitClass_SetDestination_ReplaceWithHarvestMission）——那里明确写着
-	//    "Here change the Mission::Enter to Mission::Harvest"：
-	//        pThis->QueueMission(Mission::Harvest, false);
-	//        pThis->NextMission();
-	//        pThis->MissionStatus = 2;      // Status: returning to refinery
-	//        pThis->IsHarvesting = false;
+	//   (B) SetDestination(建筑本身) + Move + Enter
+	//       → 待验证（本版）
+	//
+	//   (C) Harvest + NextMission + MissionStatus=2（照抄 Hooks.Harvester.cpp）
+	//       → 矿车【完全不动了】：NextMission() 会把刚设的 MissionStatus 冲掉，
+	//         矿车进入"该去采矿"的状态，原地发呆
+	//
+	//   结论：**移动必须靠 SetDestination + QueueMission(Move)** —— 这是唯一
+	//   被实测证明能把矿车开过去的写法；(C) 那套虽然语义正确，但会和
+	//   NextMission() 互相破坏，不能用在这里。
+	//
+	//   目的地用【建筑本身】：玩家右键点建筑下达"进入"时引擎发的就是这个，
+	//   由引擎自己去算该停到哪个停机位。
 	UnitClass* const pUnit = abstract_cast<UnitClass*>(pFoot);
 
 	if (!pUnit)
 		return Continue;
 
-	pUnit->SetArchiveTarget(pTarget);      // 记住要进哪座（引擎会用它当回厂目标）
+	pUnit->SetArchiveTarget(pTarget);   // 记住要进哪座
 	pUnit->SetTarget(nullptr);
-	pUnit->QueueMission(Mission::Harvest, false);
-	pUnit->NextMission();
-	pUnit->MissionStatus = 2;              // Status: returning to refinery
-	pUnit->IsHarvesting = false;
+	pUnit->SetDestination(pTarget, true);
+	pUnit->QueueMission(Mission::Move, false);
+	pUnit->QueueMission(Mission::Enter, false);
 
 	return Continue;
 }

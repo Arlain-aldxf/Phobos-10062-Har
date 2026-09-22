@@ -51,7 +51,12 @@ jobs:
         Write-Host "msbuild: $msbuild"
 
         # 编译，把输出同时写进文件
-        & $msbuild $sln.FullName /p:Configuration=DevBuild /p:Platform=Win32 /m /v:normal 2>&1 |
+        # ⚠️ 不要传 /p:Platform！
+        #    Phobos.sln 的 SolutionConfigurationPlatforms 只有 Debug|x86 / DevBuild|x86 / Release|x86，
+        #    而项目级才是 Win32。在【解决方案级】传 Win32 会报：
+        #      error MSB4126: The specified solution configuration "DevBuild|Win32" is invalid.
+        #    官方 build-phobos action 就是只传 Configuration、不传 Platform，这里照做。
+        & $msbuild /m /p:Configuration=DevBuild /p:GitCommit=$env:GITHUB_SHA /p:GitBranch=$env:GITHUB_REF $sln.FullName /v:normal 2>&1 |
           Tee-Object -FilePath buildlog.txt
         $code = $LASTEXITCODE
         Write-Host "msbuild exit code = $code"

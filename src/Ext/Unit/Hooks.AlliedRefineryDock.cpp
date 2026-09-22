@@ -250,27 +250,20 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (pFoot->ArchiveTarget == pTarget)
 		return Continue;
 
-	// ⚠️ 这里必须用 `auto const`，不能写成 `const CellClass* const`：
-	//    auto const 只加【底层】const（const CellClass*），顶层 const 被丢弃 → 得到 CellClass*；
-	//    显式写 `const CellClass* const` 会把【顶层】const 也带上，
-	//    于是 SetDestination(AbstractClass*, bool) 报 C2664：无法从 const CellClass* 转换。
-	//    Mission.Move.cpp 用的就是 auto const，保持完全一致。
-	const CoordStruct coord = TechnoExt::PassengerKickOutLocation(pTarget, pFoot, 10);
-	auto const pDestination = MapClass::Instance.TryGetCellAt(
-		coord != CoordStruct::Empty ? coord : pTarget->Location);
-
-	// 落点找不到 → 不要乱动，交给引擎下帧再试
-	if (!pDestination)
-		return Continue;
-
-	// 落点此刻被占（精炼厂停机位常是满的）→ 同理，不硬闯
-	if (pFoot->Locomotor->Can_Enter_Cell(pDestination->MapCoords) != Move::OK)
-		return Continue;
-
+	// ⚠️⚠️ 目的地必须用【建筑本身】，不能用 PassengerKickOutLocation
+	//
+	//    PassageKickOutLocation 算的是"从这座建筑里被扔出来时落在哪"，也就是**旁边一格**。
+	//    用它当 Destination，矿车开到旁边那格就当成终点停下了 ——
+	//    表现为【占住矿口却不进门倒矿】（实测就是这个问题）。
+	//
+	//    玩家右键点建筑下达"进入"时，引擎发的就是"目的地 = 建筑本身"，
+	//    由引擎自己去算该停到哪个停机位。
+	//
+	// 顺序也照玩家操作来：先 SetArchiveTarget（记住要进哪座），再 Move 过去，最后 Enter 进门。
 	pFoot->SetArchiveTarget(pTarget);
 	pFoot->SetTarget(nullptr);
+	pFoot->SetDestination(pTarget, true);
 	pFoot->QueueMission(Mission::Move, false);
-	pFoot->SetDestination(pDestination, true);
 	pFoot->QueueMission(Mission::Enter, false);
 
 	return Continue;

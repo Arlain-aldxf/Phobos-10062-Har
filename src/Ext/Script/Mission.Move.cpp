@@ -538,7 +538,7 @@ void ScriptExt::Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pi
 
 		pFocus = pSelectedTarget;
 		pTeam->Focus = pSelectedTarget;
-		pTeamData->DockActionTimeout = 600; // 600 frames, plenty enough for a harvester to arrive and unload
+		pTeamData->DockActionTimeout = 1800; // 60 seconds: the harvester may have to cross the map
 		pTeamData->WaitNoTargetAttempts = 0; // Disable Script Waits if there are any because a new target was selected
 		pTeamData->WaitNoTargetTimer.Stop();
 		pTeamData->WaitNoTargetCounter = 0; // Disable Script Waits if there are any because a new target was selected
@@ -605,9 +605,11 @@ void ScriptExt::Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pi
 				continue;
 			}
 
-			if (pUnit->GetStoragePercentage() <= 0.0)
+			if (pUnit->GetStoragePercentage() < 0.999)
 			{
-				// Nothing left to unload, this member is done.
+				// Only a full harvester has a load worth delivering. A half loaded one keeps
+				// mining by itself (its Harvest mission is persistent), so this action does not
+				// touch it - it just keeps waiting for it to fill up.
 				continue;
 			}
 
@@ -640,8 +642,23 @@ void ScriptExt::Mission_Move_Enter(TeamClass* pTeam, int calcThreatMode, bool pi
 					continue;
 				}
 
+				// A harvester sits inside its Harvest mission, and that mission never ends.
+				// An order that is merely queued would therefore wait behind it forever and
+				// never actually run - which is exactly what made this action look like it did
+				// nothing while the harvester walked back to its own refinery instead.
+				//
+				// So a harvester that is still harvesting gets interrupted first, exactly like
+				// the official Move action (ScriptExt::Mission_Move) does before it queues
+				// anything. Once it is on its way (Move) the orders below are only re-issued
+				// gently - re-forcing every frame would keep resetting its path.
+				if (currentMission == Mission::Harvest)
+				{
+					pUnit->SetTarget(nullptr);
+					pUnit->SetDestination(nullptr, false);
+					pUnit->ForceMission(Mission::Guard);
+				}
+
 				pUnit->SetArchiveTarget(pFocus);
-				pUnit->SetTarget(nullptr);
 				pUnit->QueueMission(Mission::Move, false);
 				pUnit->SetDestination(pDestination, true);
 
@@ -686,7 +703,10 @@ bool ScriptExt::HandleTargetEntryTimeout(TeamClass* pTeam)
 
 		auto const pUnit = abstract_cast<UnitClass*, true>(pFoot);
 
-		if (pUnit && pUnit->Type->Harvester && pUnit->GetStoragePercentage() > 0.0)
+		// "Done" means: nobody is still carrying a full load any more. It used to be
+		// "carrying any ore at all", which does not match what this action now orders -
+		// it only ever sends out harvesters that are full.
+		if (pUnit && pUnit->Type->Harvester && pUnit->GetStoragePercentage() >= 0.999)
 			allUnloaded = false;
 	}
 

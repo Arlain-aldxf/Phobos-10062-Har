@@ -285,11 +285,21 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
 		return Continue;
 
-	// ⚠️⚠️ 守卫：引擎已经在处理这座目标了 → 停手
+	// ⚠️⚠️ 守卫：已经在回【这座盟友精炼厂】了 → 停手
 	//
-	//    引擎自己会维护 ArchiveTarget：设立目标 → 对接 → 清空 → 倒矿。
-	//    只要它非空，就说明流程正在走，不要再插手下指令。
-	if (pFoot->ArchiveTarget)
+	//    ❌ 千万不能写成 `if (pFoot->ArchiveTarget) return Continue;` ——
+	//       实测（a41e424）就是栽在这一行：
+	//       探针第一行就显示 archiveTarget=10F1C6D0（非空），于是钩子立刻放行、
+	//       什么都不做，矿车【采完矿原地不动】。
+	//
+	//       原因：ArchiveTarget 对矿车来说【也用来记住矿田在哪】。
+	//       YRpp/TechnoClass.h:624 原文：
+	//         "Set when told to guard a unit or such, ... Also used by rally points
+	//          as well as harvesters for remembering ore fields etc."
+	//       矿车采完矿时，这个字段里装的是【矿田】，不是精炼厂。
+	//
+	//    ✅ 必须比较"是不是同一座盟友精炼厂"，而不是"是否非空"。
+	if (pFoot->ArchiveTarget == pTarget)
 		return Continue;
 
 	// ---- 下达"回厂倒矿"指令 ----

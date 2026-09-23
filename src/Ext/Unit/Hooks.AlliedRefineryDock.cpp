@@ -17,92 +17,91 @@
 //             换成盟友的精炼厂。
 //
 // ---------------------------------------------------------------------------
-// 【一、问题的本质：不要去跟引擎抢，要去回答引擎的问题】
+// 【零、🔴 钩子机制的硬规则（本轮用一次崩溃换来的，务必先看这条）】
 //
-//   矿车装满后，引擎自己的 UnitClass::Mission_Harvest（MissionStatus == 2，
-//   即 "returning to refinery"）会做这些事（反汇编 0x73E6CF 起，版本 = YR 1.001）：
+//   **Syringe 在钩点处写的是固定 5 字节的 `jmp`；`DEFINE_HOOK` 的第 3 个参数
+//     只决定它把多少字节的原始指令搬到别处。**
 //
-//     MissionStatus == 2 → 0x73EB2C：
+//   → 所以钩子返回的地址**必须落在 钩点+5 之外**。
+//     返回 `钩点+2` 这种"跳过一条 2 字节指令"的写法会**执行到 jmp 的中间** → 崩。
+//     实测：`DEFINE_HOOK(0x73EC4D, ..., 0x2)` + `return 0x73EC4F`
+//           → `Exception 0xC0000005 at 0x0073EC4F`（`dec ecx` 一条绝不会崩的指令崩了，
+//             正说明那里的字节已经被 jmp 覆盖）。
+//
+//   → 于是本文件所有钩点的返回地址都按"跳到下一段安全代码"来选，
+//     并且**凡是依赖标志位的判断，一律由钩子自己显式完成**（见下）。
+//
+// ---------------------------------------------------------------------------
+// 【一、引擎的回厂流水线（反汇编 0x73E6CF 起，YR 1.001；EBP = 这辆载具）】
+//
+//   MissionStatus == 2 → 0x73EB2C：
 //     0073EB5A  mov  eax,[ebp+0x5A4]       ; ★ FootClass::Destination
 //     0073EB60  test eax,eax
-//     0073EB62  jne  0x73EF77              ; 已经有目的地 → 本帧什么都不做
+//     0073EB62  jne  0x73EF77              ; 已经有目的地 → 本帧什么都不做（等它开到）
 //     0073EB68  mov  ecx,[ebp+0x6C4]       ; UnitTypeClass*
-//     0073EB73  add  ecx,0x3E8             ; &UnitTypeClass::Dock（TypeList<BuildingTypeClass*>）
+//     0073EB73  add  ecx,0x3E8             ; &UnitTypeClass::Dock
 //     0073EB7E  call [eax+0x528]           ; ★★ 第一次挑建筑 EAX = FindDock(&Type->Dock,0,0)
-//     0073EB84  test bl,bl                 ; ★★★ 钩点 A（2 字节）
+//     0073EB84  test bl,bl                 ; ★★★ 钩点 A          bl = UnitTypeClass+0xCD4
 //     0073EB86  mov  esi,eax
-//     0073EB88  jne  0x73EDC0              ; bl≠0 支路（矿车走这条）
+//     0073EB88  jne  0x73EDC0              ; bl≠0 支路
 //     0073EB8E  test esi,esi               ; bl＝0 支路
 //     0073EB90  je   0x73EC1F
-//     …算距离…
-//     0073EC17  cmp  eax, edx              ; edx = Rules[0xD7C]<<8（或 0xD78）
-//     0073EE51  call [eax+0x278](2, esi)   ; 够近 → 开始对接
-//     0073EE68  mov  [ebp+0xBC],3          ; MissionStatus = 3
+//     …算距离 → 够近(≤Rules[0xD78]<<8) → 0x73EE51 开始对接 / 太远 → 0x73EC1F 重试
 //
-//     0073EC1F  （太远 / 对接没成 → 重试支路）
-//     0073EC30  mov  eax,[ebp+0x6C4] / add eax,0x3E8
-//     0073EC41  call [edx+0x528]           ; ★★ 第二次挑建筑（同样的调用！）
-//     0073EC4D  mov  esi,eax               ; ★★★ 钩点 B（2 字节）
+//     0073EDC0  （bl≠0 支路）…算距离 → 够近(≤Rules[0xD7C]<<8) → 0x73EE51 / 太远 → 0x73EC1F
+//
+//     0073EC1F  （重试支路）
+//     0073EC41  call [edx+0x528]           ; ★★ 第二次挑建筑（同一次查询！）
+//     0073EC47  mov  ecx,[0xa8e7ac]        ; 重试计数器
+//     0073EC4D  mov  esi,eax
+//     0073EC4F  dec  ecx
 //     0073EC50  test esi,esi
-//     0073EC58  je   0x73EF77              ; 挑不到 → 放弃，本帧什么都不做
+//     0073EC52  mov  [0xa8e7ac],ecx
+//     0073EC58  je   0x73EF77              ; ★★★ 钩点 B：挑不到 → 放弃，什么都不做
 //     0073EC5E  …算距离…
 //     0073ECD0  cmp  eax,0x300             ; 3 格
 //     0073ECD5  jg   0x73ECDF
-//     0073ECD7  test bl,bl ; je 0x73EF77   ; bl＝0 且很近 → 放弃
+//     0073ECD7  test bl,bl                 ; ★★★ 钩点 C
+//     0073ECD9  je   0x73EF77              ; bl＝0 且"很近" → 也放弃
 //     0073ECDF  …算停机坪那一格…
 //     0073EDB5  call [esi+0x480](cell, 1)  ; ★ 太远 → 把 Destination 设成停机坪，开过去
-//     0073EDBB  jmp  0x73EF77
 //
-//     下一帧 MissionStatus == 3 → 0x73EE8A：QueueMission(Mission::Enter) → 进厂、卸货
+//     0073EE51  call [eax+0x278](2, esi)   ; 够近 → 开始对接
+//     0073EE5F  cmp  eax,1
+//     0073EE62  jne  0x73EC1F              ; 对接没成 → 重试
+//     0073EE68  mov  [ebp+0xBC],3          ; MissionStatus = 3
 //
-//   **"挑建筑 → （太远先开去停机坪）→ 靠近 → 对接 → 进厂卸货"这条流水线引擎全有。**
-//   长征方没有自家精炼厂时它之所以卡住，是因为这条流水线的**第一个输入**没了：
-//   FindDock 只在自己的 Dock 清单里、按**自己的阵营**找建筑，找不到就返回 0。
-//   于是 0x73EC58 直接放弃 → 没人给矿车设目的地 → **矿车原地不动**。
+//   MissionStatus == 3 → 0x73EE8A：QueueMission(Mission::Enter) → 进厂、卸货
 //
-//   ⚠️⚠️ 所以**两次挑建筑都必须改答案**（钩点 A 与钩点 B），缺一不可：
-//      第一次距离必然"太远"（矿车在矿田上、精炼厂隔好几格）→ 一定落到重试支路，
-//      而重试支路那次挑建筑如果不改答案，引擎照样拿到 0 → 0x73EC58 放弃 → 还是不动。
-//      实测（49fe8b3）就是这样：探针 `redirected=1`、`engineSaid=0`、**`dest=0`**，
-//      矿车满载后一步不走。
+//   **三个"出口"必须全部堵住**，否则引擎就在其中一处静悄悄地放弃：
+//     · 第一次挑建筑 → 引擎返回 0（长征方没有自家精炼厂）→ 钩点 A 换成盟友的
+//     · 重试再挑一次   → 引擎还是返回 0 → 钩点 B 换成盟友的（否则 0x73EC58 放弃）
+//     · bl＝0 的类型    → 0x73ECD9 会"就近放弃" → 钩点 C 接管这个判断
+//   实测（fad82a8）：只堵了前两处时，探针里 `dest=00000000` 一直不变
+//   —— 引擎从头到尾没给矿车设过目的地，所以它一步不走。
 //
 // ---------------------------------------------------------------------------
-// 【二、字段偏移（这是本次最重要的更正，前几轮一直搞错了）】
+// 【二、字段偏移（本次最重要的更正，前几轮一直搞错了）】
 //
-//   · FootClass::Destination  = FootClass + 0x5A4  ← 引擎在 Harvest 里读的就是它
-//       YRpp/FootClass.h:175  AbstractClass* Destination;
-//       0x4DF0D0（FootClass::AbortMotion）清的就是 [+0x5A0] 与 [+0x5A4]。
-//
-//   · TechnoClass::ArchiveTarget = TechnoClass + 0x218
-//       YRpp/TechnoClass.h:448  void SetArchiveTarget(AbstractClass*) { JMP_THIS(0x70C610); }
-//       反汇编 0x70C610 只有两句：8B 44 24 04  mov eax,[esp+4]
-//                                 89 81 18 02 00 00  mov [ecx+0x218],eax   ← 写的是 0x218
-//
+//   · FootClass::Destination    = FootClass  + 0x5A4  ← 引擎在 Harvest 里读的就是它
+//   · TechnoClass::ArchiveTarget = TechnoClass + 0x218 ← 引擎在别处读它
+//       `SetArchiveTarget` = 0x70C610，全文只有两句：
+//         8B 44 24 04        mov eax,[esp+4]
+//         89 81 18 02 00 00  mov [ecx+0x218],eax     ← 写的是 0x218，不是 0x5A4
 //   → 前几轮把 [ebp+0x5A4] 当成 ArchiveTarget，守卫条件全建立在错误字段上。
 //
 // ---------------------------------------------------------------------------
-// 【三、为什么必须显式跳分支，不能靠标志位】
-//
-//   钩点 A 钩掉的正是 0x73EB84 的 `test bl,bl`。这条指令被挪走后，紧随的
-//   `jne 0x73EDC0` 读到的是 C++ 代码留下的**垃圾标志位**。
-//   （本会话前几轮在同一个坑里摔了两次：test bl,bl、test ecx,ecx。）
-//   → 钩子里必须**自己判断、自己跳**，bl 从 UnitTypeClass+0xCD4 原样读出。
-//   钩点 B（0x73EC4D）不带条件跳转，只需照原样写回 EAX/ESI。
-//
-// ---------------------------------------------------------------------------
-// 【四、走过的弯路（别再重走）】
+// 【三、走过的弯路（别再重走）】
 //
 //   · 钩 FootClass::Find_Dock(0x4DEE80) —— 那是 [vtable+0x52C]「在某一类建筑里找
-//     我方可用的那一座」，不是流水线入口，钩它没意义。
+//     我方可用的那一座」，不是流水线入口。
 //   · 只写 EAX / 只写 ESI / 两个都写 —— 只换寄存器并不会让引擎主动开过去。
-//   · SetArchiveTarget / QueueMission(Harvest/Enter) / SetDestination 自己下命令 ——
+//   · 自己 SetArchiveTarget / QueueMission(Harvest/Enter) / SetDestination 下命令 ——
 //     和引擎的 Harvest 状态机抢时间线，实测：原地不动、开过去不倒矿、抖动、卡在矿里。
-//   · 用 Mission::Enter 而不是 Harvest —— 对矿车是错的
-//     （Phobos 自己挂 0x74312A 把 Enter 改成 Harvest，见 Hooks.Harvester.cpp）。
-//   · 只钩第一次挑建筑（0x73EB84）—— 见上面【一】的 ⚠️。
+//   · 钩点返回 `钩点+2` —— 见【零】，会崩。
 //
 // ---------------------------------------------------------------------------
-// 【五、生效条件（四个全满足才改答案，缺一即完全放行）】
+// 【四、生效条件（四个全满足才改答案，缺一即完全放行原版行为）】
 //
 //   ① 是矿车（UnitTypeClass::Harvester）
 //   ② 满载（GetStoragePercentage() >= 0.999）
@@ -114,7 +113,9 @@
 namespace AlliedRefineryDock
 {
 	// 引擎在 0x73E6DE 读的那个类型开关字节：`mov bl, byte ptr [eax+0xCD4]`
-	// 它只负责在两条"距离判断/兜底"支路之间分流，这里照原值读出、照原值走。
+	// 它决定"太远/很近"时走哪条兜底支路（0x73EDC0 / 0x73EB8E / 0x73ECD9）。
+	// 实测两台矿车取值不同（一台 0xFF、一台 0x00），所以**必须照原值分流**，
+	// 不能假设所有矿车一样。
 	static bool ReadTypeFlag0xCD4(FootClass* pFoot)
 	{
 		TechnoTypeClass* const pType = pFoot->GetTechnoType();
@@ -125,7 +126,7 @@ namespace AlliedRefineryDock
 		return *reinterpret_cast<const BYTE*>(reinterpret_cast<const char*>(pType) + 0xCD4) != 0;
 	}
 
-	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿
+	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿。
 	// 不做可达性预判 —— 引擎自己的选择流程也不做，
 	// 它会在"太远"时先把 Destination 设成停机坪那一格，再靠近、再对接。
 	static BuildingClass* FindNearestAlliedRefinery(FootClass* pFoot)
@@ -190,10 +191,20 @@ namespace AlliedRefineryDock
 		return FindNearestAlliedRefinery(pFoot);
 	}
 
+	// 决定改道时，顺手把 ArchiveTarget 也指到那座精炼厂。
+	// 理由：引擎自己决定回厂时（0x73EAF2 / 0x73EA7B）也会 SetArchiveTarget，
+	// 而 10062 动作（唯一实测跑通过的那条路）同样是 SetArchiveTarget + Enter。
+	// 只改 Destination 而不改 ArchiveTarget，卸货环节可能找不到该往哪座建筑卸。
+	static void MarkAsDockTarget(FootClass* pFoot, BuildingClass* pRefinery)
+	{
+		if (pRefinery)
+			pFoot->SetArchiveTarget(pRefinery);
+	}
+
 	// ---- 状态变化记录（诊断用；只在状态改变时写一行）----
 	// 只记变化 + 每行 fflush，所以"崩了也不丢"，且不刷屏。
-	// dest 是否被设上也要进 key —— "引擎有没有给矿车目的地"是判断卡在哪的关键。
-	static void Trace(FootClass* pFoot, const void* pEngineAnswer, const void* pResult,
+	// dest 是否被设上进 key —— "引擎有没有给矿车目的地"是判断卡在哪的关键。
+	static void Trace(FootClass* pFoot, BuildingClass* pEngineAnswer, BuildingClass* pResult,
 		bool redirected, int site)
 	{
 		static FILE* s_log = nullptr;
@@ -230,7 +241,7 @@ namespace AlliedRefineryDock
 			{
 				fprintf(s_log,
 					"#%-3d site=%d mission=%-3u status=%-3u storage=%.3f dest=%p archiveTarget=%p "
-					"engineSaid=%p weReturned=%p redirected=%u linked=%u typeFlag=0x%02X\n",
+					"engineSaid=%p weReturned=%p redirected=%u linked=%u typeFlag=0x%02X dist=%d\n",
 					s_lines, site,
 					static_cast<unsigned>(curMission),
 					static_cast<unsigned>(curStatus),
@@ -241,7 +252,8 @@ namespace AlliedRefineryDock
 					pResult,
 					static_cast<unsigned>(redirected ? 1 : 0),
 					static_cast<unsigned>(linked),
-					ReadTypeFlag0xCD4(pFoot) ? 0xFF : 0x00);
+					ReadTypeFlag0xCD4(pFoot) ? 0xFF : 0x00,
+					pResult ? pFoot->DistanceFrom(pResult) : -1);
 				fflush(s_log);
 			}
 		}
@@ -251,14 +263,13 @@ namespace AlliedRefineryDock
 // ---------------------------------------------------------------------------
 // 钩点 A：0x73EB84 —— 引擎【第一次】问完"我该去哪座精炼厂"，我们在这里改答案
 //
-//   进入时：EAX = 引擎自己找到的建筑（自家精炼厂，或 0 = 没找到）
-//   离开时：EAX/ESI = 我们要它去的建筑，并按 bl 走引擎原本的分支
+//   Syringe 的 5 字节 jmp 覆盖 0x73EB84~0x73EB88（`test bl,bl` + `mov esi,eax`
+//   + `jne` 的头一个字节），所以：
+//     · `mov esi,eax` 不会执行 → ESI 必须由我们写；
+//     · 标志位没了 → 必须自己显式跳 0x73EB8E / 0x73EDC0（两者都在 jmp 之外）。
 // ---------------------------------------------------------------------------
 DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 {
-	// 引擎原本在这条指令之后的两条支路（必须自己显式跳，不能靠标志位）：
-	//   0x73EB88  jne 0x73EDC0   ; bl ≠ 0
-	//   0x73EB8E  test esi,esi   ; bl ＝ 0
 	enum { Path_BlZero = 0x73EB8E, Path_BlNonZero = 0x73EDC0 };
 
 	GET(FootClass* const, pFoot, EBP);
@@ -267,9 +278,8 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 	BuildingClass* const pAlliedRefinery = AlliedRefineryDock::GetRedirectTarget(pFoot);
 	BuildingClass* const pResult = pAlliedRefinery ? pAlliedRefinery : pOriginalTarget;
 
-	// 引擎接下来三条支路全都从 ESI 取"落点建筑"（0x73EB96 mov edx,[esi] /
-	// 0x73EDC8 mov eax,[esi] / 0x73EC4D mov esi,eax）。
-	// 0x73EB86 的 `mov esi,eax` 已被本钩子跳过，所以 ESI 由我们写。
+	AlliedRefineryDock::MarkAsDockTarget(pFoot, pAlliedRefinery);
+
 	R->EAX(pResult);
 	R->ESI(pResult);
 
@@ -279,31 +289,53 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 }
 
 // ---------------------------------------------------------------------------
-// 钩点 B：0x73EC4D —— 引擎【第二次】挑建筑（重试支路）之后，同样要改答案
+// 钩点 B：0x73EC58 —— 重试支路里"这次挑到了吗？"的判断（`je 0x73EF77`）
 //
-//   为什么必须有这个钩子：矿车在矿田上、精炼厂隔好几格 → 第一次必然判定"太远"
-//   → 走 0x73EC1F 重试支路 → 那里又调一次 FindDock（0x73EC41）。
-//   只钩第一次的话，引擎在重试里照样拿到 0 → 0x73EC58 放弃 → 矿车原地不动。
-//
-//   0x73EC4D 是 `mov esi,eax`（2 字节），紧随其后是 0x73EC4F `dec ecx`（重试计数器的
-//   还原）、0x73EC50 `test esi,esi`、0x73EC52 `mov [0xa8e7ac],ecx`、0x73EC58 `je 0x73EF77`。
-//   所以这里回 **0x73EC4F**（钩点 + 2）让后续原封不动执行：计数器照常还原、
-//   `test esi,esi` 拿的是我们写好的 ESI，标志位由它自己产生 —— 没有任何坑。
+//   这里替换的是一条 6 字节的 `je`，5 字节 jmp 之后还剩 1 个字节，
+//   但因为我们**永远显式跳到 0x73EC5E 或 0x73EF77**，那一个残留字节不会被执行。
+//   0x73EC4F 的 `dec ecx`（重试计数器还原）和 0x73EC50 的 `test esi,esi`
+//   都在钩点之前，原封不动执行 —— 计数器不会漏，也不碰任何标志位。
 // ---------------------------------------------------------------------------
-DEFINE_HOOK(0x73EC4D, FootClass_HarvestReturn_PreferAlliedRefinery_Retry, 0x2)
+DEFINE_HOOK(0x73EC58, FootClass_HarvestReturn_PreferAlliedRefinery_Retry, 0x6)
 {
-	enum { Continue = 0x73EC4F }; // → dec ecx ; test esi,esi ; je 0x73EF77 ; 继续算距离
+	enum { ComputeDistance = 0x73EC5E, GiveUp = 0x73EF77 };
 
 	GET(FootClass* const, pFoot, EBP);
-	GET(BuildingClass* const, pOriginalTarget, EAX);
+	GET(BuildingClass* const, pEngineAnswer, ESI);
 
 	BuildingClass* const pAlliedRefinery = AlliedRefineryDock::GetRedirectTarget(pFoot);
-	BuildingClass* const pResult = pAlliedRefinery ? pAlliedRefinery : pOriginalTarget;
 
-	R->EAX(pResult);
+	if (!pAlliedRefinery && !pEngineAnswer)
+		return GiveUp;                     // 原版行为：重试也挑不到 → 放弃
+
+	BuildingClass* const pResult = pAlliedRefinery ? pAlliedRefinery : pEngineAnswer;
+
+	AlliedRefineryDock::MarkAsDockTarget(pFoot, pAlliedRefinery);
+
 	R->ESI(pResult);
 
-	AlliedRefineryDock::Trace(pFoot, pOriginalTarget, pResult, pAlliedRefinery != nullptr, 2);
+	AlliedRefineryDock::Trace(pFoot, pEngineAnswer, pResult, pAlliedRefinery != nullptr, 2);
 
-	return Continue;
+	return ComputeDistance;
+}
+
+// ---------------------------------------------------------------------------
+// 钩点 C：0x73ECD7 —— `test bl,bl / je 0x73EF77`：bl＝0 的类型会"就近放弃"
+//
+//   引擎原意：bl＝0 的类型，只要在 3 格以内就不必专门开去停机坪了。
+//   但对我们来说"已经在盟友矿场附近"恰恰是**最该继续走完对接**的时候，
+//   而且实测两台矿车的 bl 取值不同 —— 不改这里，其中一台永远拿不到目的地。
+//   （Syringe 的 jmp 覆盖 0x73ECD7~0x73ECDB，所以显式跳到 0x73ECDF / 0x73EF77。）
+// ---------------------------------------------------------------------------
+DEFINE_HOOK(0x73ECD7, FootClass_HarvestReturn_PreferAlliedRefinery_DontGiveUp, 0x2)
+{
+	enum { GoToDockPad = 0x73ECDF, GiveUp = 0x73EF77 };
+
+	GET(FootClass* const, pFoot, EBP);
+
+	if (AlliedRefineryDock::GetRedirectTarget(pFoot))
+		return GoToDockPad;
+
+	// 原样重现引擎的 `test bl,bl ; je 0x73EF77`
+	return AlliedRefineryDock::ReadTypeFlag0xCD4(pFoot) ? GoToDockPad : GiveUp;
 }

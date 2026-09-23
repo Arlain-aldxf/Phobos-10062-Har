@@ -5,80 +5,143 @@
 #include <HouseClass.h>
 #include <TechnoClass.h>
 #include <TechnoTypeClass.h>
-#include <MapClass.h>
-#include <CellClass.h>
 
 #include <Ext/Script/Body.h>
-#include <Ext/Techno/Body.h>
 
 #include <Utilities/Macro.h>
 
 #include <cstdio>   // 诊断用的状态记录
 
 // ============================================================================
-// 10062 配套：让"给盟友倒矿"的矿车，把落点换成盟友的精炼厂
+// 10062 配套：让"脚本里启用了 10062 的小队"的矿车，把【回厂倒矿】的落点
+//             换成盟友的精炼厂。
 //
-// 【问题的本质】
-//   长征方【没有任何自家精炼厂】时，矿车采满矿后引擎要"回自家倒矿"，
-//   却找不到任何自家矿场 → 没有目的地 → 矿车原地停下。
-//   脚本的 10062 是在动作执行那一刻发出的，矿车装满时那一刻早已过去，
-//   所以没人再命令它 → 这就是"引擎抢在脚本前面"的现象。
+// ---------------------------------------------------------------------------
+// 【一、问题的本质：不要去跟引擎抢，要去回答引擎的问题】
 //
-// 【解法：替引擎把它缺的那个字段填上】
+//   矿车装满后，引擎自己的 UnitClass::Mission_Harvest（MissionStatus == 2，
+//   即 "returning to refinery"）会做这些事（反汇编 0x73E6CF 起，版本 = YR 1.001）：
 //
-//   0073EB2C  mov  ecx,[ebp+0x5A4]         ; ← ArchiveTarget（目的地字段）
-//   0073EB32  test ecx,ecx
-//   0073EB34  je   0x73EB5A                ; 有目标 → 用它；没有 → 往下挑建筑
-//   0073EB49  call dword ptr [edx+0x528]   ; 挑建筑的虚函数
-//   0073EB51  je   0x73EB5A
-//   0073EB55  call 0x4DF0D0                ; 清空 [this+0x5A0] / [this+0x5A4]
-//   0073EB5A  mov  eax,[ebp+0x5A4]         ; 再读一次 ArchiveTarget
-//   0073EB60  test eax,eax
-//   0073EB62  jne  0x73EF77                ; 有目标 → 前往该目标
-//   0073EB68  ...                          ; 还是没有 → 继续挑
-//   0073EB7E  call dword ptr [eax+0x528]   ; 挑建筑的虚函数调用（返回值在 EAX）
-//   0073EB84  test bl,bl                   ; 2 字节  <<< 钩这里
-//   0073EB86  mov  esi,eax
-//   0073EB88  jne  0x73EDC0
-//   0073EB8E  test esi,esi
-//   0073EB90  je   0x73EC1F
-//   0073EB96  mov  edx,[esi]
+//     0073E6DB  cmp ecx, 4                 ; ecx = MissionStatus
+//     0073E6EA  jmp [ecx*4 + 0x73EFAC]     ; 跳表：0→0x73E6F1 1→0x73E931 2→0x73EB2C 3→0x73EE8A 4→0x73EEA6
 //
-//   ArchiveTarget 就是 SetArchiveTarget() 写的字段（JMP_THIS(0x70C610)），
-//   也正是引擎自己在 0x73EAF2 / 0x73EA7B 调用的那个函数。
+//     MissionStatus == 2 → 0x73EB2C：
+//     0073EB2C  mov  ecx,[ebp+0x5A4]       ; FootClass::Destination（见【二】）
+//     0073EB32  test ecx,ecx
+//     0073EB34  je   0x73EB5A
+//     0073EB36  test bl,bl                 ; bl = UnitTypeClass+0xCD4（类型上的一个开关字节）
+//     0073EB38  je   0x73EB5A
+//     0073EB49  call [edx+0x528]           ; 有目的地时：确认这目的地还有效吗
+//     0073EB55  call 0x4DF0D0              ; 无效 → AbortMotion()（清 Destination/unknown_5A0）
+//     0073EB5A  mov  eax,[ebp+0x5A4]       ; ★ Destination
+//     0073EB60  test eax,eax
+//     0073EB62  jne  0x73EF77              ; 已经有目的地 → 本帧什么都不做
+//     0073EB68  mov  ecx,[ebp+0x6C4]       ; UnitTypeClass*
+//     0073EB73  add  ecx,0x3E8             ; &UnitTypeClass::Dock（TypeList<BuildingTypeClass*>）
+//     0073EB7E  call [eax+0x528]           ; ★★ EAX = FindDock(&Type->Dock, 0, 0)
+//     0073EB84  test bl,bl                 ; ★★★ 我们钩这里
+//     0073EB86  mov  esi,eax
+//     0073EB88  jne  0x73EDC0              ; bl≠0 分支
+//     0073EB8E  test esi,esi
+//     0073EB90  je   0x73EC1F
+//     0073EB96  ...                        ; 算"我"到 ESI 的距离
+//     0073EC19  jle  0x73EE51              ; 够近 → 0x73EE51 开始对接
+//     0073EC1F  ...                        ; 太远 → 走停机坪（0x73ECDF 起）
+//     0073EE51  push esi / push 2 / call [eax+0x278]   ; 开始对接
+//     0073EE68  mov  [ebp+0xBC],3          ; MissionStatus = 3
 //
-//   **只要在它读之前把 ArchiveTarget 填好，引擎自己就会走完整条"前往倒矿"的路**
-//   —— 不需要碰任何寄存器、任何分支。
+//     下一帧 MissionStatus == 3 → 0x73EE8A：
+//     0073EE8F  push 7                     ; Mission::Enter
+//     0073EE93  call [edx+0x1E8]           ; QueueMission(Enter) —— 进厂、卸货
 //
-// 【为什么不改寄存器】（实测结果，2026-09-22 夜）
+//   也就是说：**"挑哪座建筑 → 开过去 → 进厂卸货"这一整条流水线，引擎自己全都有，
+//   而且能跨地图距离工作**（太远时它会把 Destination 设成停机坪那一格）。
+//   长征方没有自家精炼厂时它之所以卡住/崩，是因为这条流水线的**第一个输入**没了：
+//   FindDock 只在自己的 Dock 清单（[HARV]/[CMIN] 的 Dock= 那几个建筑类型）里、
+//   按**自己的阵营**找建筑，找不到就返回 0 → 整条流水线空转 → 矿车原地不动。
+//   （旧版曾经在这里写出"垃圾指针"，其实那是我们自己钩子破坏了标志位/指令边界造成的，
+//     不是引擎返回垃圾 —— 见【四】。）
 //
-//   | 版本    | 写了什么  | 结果                     |
-//   |---------|-----------|--------------------------|
-//   | 3cae517 | 只写 EAX  | 不崩，但矿车【不动】     |
-//   | ed7a6f5 | 只写 ESI  | 【不崩】，但矿车【停下】 |
+//   所以我们**只需要在流水线入口把答案换掉**：
+//   钩 0x73EB84，把 EAX/ESI 换成盟友精炼厂，然后照原样走引擎的分支。
+//   不再自己去 SetArchiveTarget / QueueMission / SetDestination ——
+//   那些"自己下命令"的做法会被引擎的 Harvest 状态机反复冲掉（实测多轮都是这个死法）。
 //
-//   结论：**只写 ESI 不会崩，但也不生效** → 引擎判断目的地不看寄存器，看字段。
-//   （详见下方钩子处的"同一坑摔两次"更正：早期以为"双写会崩"，其实是探针自己崩的。）
+// ---------------------------------------------------------------------------
+// 【二、字段偏移（这一条是本次最重要的更正，前几轮一直搞错了）】
 //
-// 早期版本的错误（记录以免重犯）：
-//   ① 曾把钩子挂在 FootClass::Find_Dock（0x4DEE80）的两条出口上 —— 但那个函数
-//      在整份 gamemd.exe 里没有任何 call（只有 4 处虚表引用），根本不在这条路上，
-//      所以"毫无反应"。
-//   ② 曾连续三代都在纠结"该写 EAX 还是 ESI" —— 方向本身就错了，见上表。
-//   ③ 钩点必须"跳过 test bl,bl"、返回 0x73EB88，让引擎自己执行那条 test；
-//      把它吃掉会让 `jne` 读到 C++ 留下的垃圾标志位 → 走错分支 → 崩。
+//   · FootClass::Destination  = FootClass + 0x5A4  ← 引擎在 Harvest 里读的就是它
+//       YRpp/FootClass.h:175  AbstractClass* Destination;
+//       0x4DF0D0（FootClass::AbortMotion）清的就是 [+0x5A0] 与 [+0x5A4]。
 //
-// 生效条件（四个全满足才动手，缺一即完全放行）
+//   · TechnoClass::ArchiveTarget = TechnoClass + 0x218
+//       YRpp/TechnoClass.h:448  void SetArchiveTarget(AbstractClass*) { JMP_THIS(0x70C610); }
+//       反汇编 0x70C610 只有一句：8B 44 24 04  mov eax,[esp+4]
+//                              89 81 18 02 00 00  mov [ecx+0x218],eax   ← 写的是 0x218，不是 0x5A4
+//
+//   → 前几轮把 [ebp+0x5A4] 当成 ArchiveTarget，于是"守卫条件"全建立在错误字段上：
+//     探针里 pFoot->ArchiveTarget（= 0x218）打印出矿田地址（非空），
+//     而被钩的那段代码里 [ebp+0x5A4]（= Destination）其实是空的 —— 两者根本不是一回事。
+//     ArchiveTarget 对矿车来说确实也用来记矿田（YRpp 注释原文），但**不是**这段代码读的字段。
+//
+// ---------------------------------------------------------------------------
+// 【三、为什么必须显式跳分支，不能靠标志位】
+//
+//   我们钩掉的是 0x73EB84 的 `test bl,bl`（2 字节）。这条指令被挪走后，
+//   紧随其后的 `jne 0x73EDC0`(0x73EB88) 读到的就是 C++ 代码留下的**垃圾标志位**。
+//   （本会话前几轮在同一个坑里摔了两次：0x73EB84 的 test bl,bl、0x73EB32 的 test ecx,ecx。）
+//
+//   唯一可靠的做法：钩子里**自己判断、自己跳**。
+//     bl ＝ UnitTypeClass + 0xCD4（引擎在 0x73E6DE 读的那个字节），
+//     照原值决定回 0x73EDC0（bl≠0）还是 0x73EB8E（bl＝0），语义与引擎完全一致。
+//   （0x73EB86 的 `mov esi,eax` 也一并被跳过，所以 ESI 由我们自己写。）
+//
+//   bl 这个字节 YRpp 没有命名，但它的作用只是"分流两条距离判断支路"，
+//   我们**不解释它、只照抄它**，因此没有语义风险。
+//
+// ---------------------------------------------------------------------------
+// 【四、走过的弯路（别再重走）】
+//
+//   · 钩 FootClass::Find_Dock(0x4DEE80) 的出口 —— 0x4DEE80 其实是
+//     "在某一类建筑里找我方可用的那一座"（[vtable+0x52C]），不是整条流水线的入口，
+//     钩它没有意义。
+//   · 只写 EAX / 只写 ESI / 两个都写 —— 都无效或崩。原因有二：
+//     ① 写 EAX 会被 0x73EB86 的 `mov esi,eax` 覆盖（如果那条指令还在）；
+//     ② 更根本的是：**只换寄存器并不会让引擎主动开过去**，
+//        而这段代码恰好是"换掉答案后引擎就会自己开过去"的地方 —— 关键在钩点，不在寄存器。
+//   · SetArchiveTarget / QueueMission(Harvest/Enter) / SetDestination 自己下命令 ——
+//     和引擎的 Harvest 状态机抢时间线，实测：原地不动、开过去不倒矿、抖动、卡在矿里。
+//   · 用 Mission::Enter 而不是 Harvest —— 对矿车是错的（Phobos 自己挂了
+//     0x74312A 的钩子把 Enter 改成 Harvest，见 Hooks.Harvester.cpp）。
+//     本方案不再碰任务，所以这条坑自然绕开了。
+//
+// ---------------------------------------------------------------------------
+// 【五、生效条件（四个全满足才改答案，缺一即完全放行）】
+//
 //   ① 是矿车（UnitTypeClass::Harvester）
 //   ② 满载（GetStoragePercentage() >= 0.999）
 //   ③ 所属小队的脚本里启用了 10062（ScriptExt::IsTeamUsingMoveEnterAction）
-//      —— 注意不是"此刻正停在这一行"：矿车满载时小队往往已在后续行上
-//   ④ 场上找得到"盟友的、不是自家的、可达的"精炼厂
+//      —— 不是"此刻正停在这一行"：矿车满载时小队往往已经走到后面的行
+//   ④ 场上找得到"盟友的、不是自家的、活着的"精炼厂
 // ============================================================================
 
 namespace AlliedRefineryDock
 {
-	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿、必须开得进去
+	// 引擎在 0x73E6DE 读的那个类型开关字节：`mov bl, byte ptr [eax+0xCD4]`
+	// 它只负责在两条"距离判断/兜底"支路之间分流，这里照原值读出、照原值走。
+	static bool ReadTypeFlag0xCD4(FootClass* pFoot)
+	{
+		TechnoTypeClass* const pType = pFoot->GetTechnoType();
+
+		if (!pType)
+			return false;
+
+		return *reinterpret_cast<const BYTE*>(reinterpret_cast<const char*>(pType) + 0xCD4) != 0;
+	}
+
+	// 挑"最近的盟友精炼厂"：排除自家、排除敌人、必须能倒矿
+	// 不做可达性预判 —— 引擎自己的选择流程也不做，
+	// 它会在"太远"时先把 Destination 设成停机坪那一格，再靠近、再对接。
 	static BuildingClass* FindNearestAlliedRefinery(FootClass* pFoot)
 	{
 		BuildingClass* pBest = nullptr;
@@ -91,7 +154,7 @@ namespace AlliedRefineryDock
 			if (!pBuilding || !pBuilding->Type || !pBuilding->Owner || pBuilding->Health <= 0)
 				continue;
 
-			// 必须不是自家的
+			// 必须不是自家的（否则就是原版行为，不用我们插手）
 			if (pBuilding->Owner == pFoot->Owner)
 				continue;
 
@@ -111,20 +174,6 @@ namespace AlliedRefineryDock
 				bestDistance = distance;
 			}
 		}
-
-		if (!pBest)
-			return nullptr;
-
-		// 确认开得进去（避免"目的地过不去"导致来回抖动）
-		const CoordStruct coord = TechnoExt::PassengerKickOutLocation(pBest, pFoot, 10);
-		const CellClass* const pDestination = MapClass::Instance.TryGetCellAt(
-			coord != CoordStruct::Empty ? coord : pBest->Location);
-
-		if (!pDestination)
-			return nullptr;
-
-		if (pFoot->Locomotor->Can_Enter_Cell(pDestination->MapCoords) != Move::OK)
-			return nullptr;
 
 		return pBest;
 	}
@@ -147,7 +196,7 @@ namespace AlliedRefineryDock
 		if (pFoot->GetStoragePercentage() < 0.999)
 			return nullptr;
 
-		// ③ 所属小队的脚本启用了 10062
+		// ③ 所属小队的脚本里启用了 10062
 		if (!ScriptExt::IsTeamUsingMoveEnterAction(pFoot->Team))
 			return nullptr;
 
@@ -157,93 +206,44 @@ namespace AlliedRefineryDock
 }
 
 // ---------------------------------------------------------------------------
-// 钩点：0x73EB84 —— 最终方案 = 【防崩】+【真的开过去】，两者缺一不可
+// 钩点：0x73EB84 —— 引擎刚问完"我该去哪座精炼厂"，我们在这里改答案
 //
-// 【一、写 ESI 是为了防崩（这是硬需求，不是猜的）】
-//
-//   引擎在 0x73EB7E 调 `[eax+0x528]` 挑建筑。**在"长征方没有任何自家精炼厂"
-//   这个场景下它找不到可回的建筑，返回的不是建筑指针，而是一个内部字段地址**
-//   —— 崩溃时实测 esi = ebp + 0xC8，解引用出来是 0x651 这种垃圾值。
-//
-//   而接下来三条支路**全都**要 ESI 装"建筑"：
-//     · BL=0  → 0x73EB86 mov esi,eax → 0x73EB8E test esi,esi → 0x73EB96 mov edx,[esi]
-//     · BL≠0  → 0x73EB88 jne 0x73EDC0 → 0x73EDC8 mov eax,[esi]
-//     · 挑不到 → 0x73EB90 je 0x73EC1F（只有这条会自己重新 mov esi,eax）
-//   → ESI 是垃圾就崩在 0x73EB9F（实测两次都是这里，且与"改不改寄存器"无关：
-//     连"一个寄存器都不碰"的版本也崩在同一个地址）。
-//   → **把 ESI 换成合法建筑，崩溃就消失**（实测：只写 ESI 那版全程不崩）。
-//
-// 【二、还要自己下达指令，是为了真的开过去】
-//
-//   只写 ESI 那版**不崩、但矿车也不动**：引擎只是拿 ESI 去算距离/优先级，
-//   并不会因此主动开过去。**目的地必须显式下达。**
-//
-//   所以照抄 Mission.Move.cpp 里 10062 主流程、**已在测试 02 走通过**的写法：
-//     SetArchiveTarget(pTarget)         ← 告诉引擎"我要进这个建筑"
-//     SetTarget(nullptr)                ← 清掉可能还指着矿田的目标
-//     QueueMission(Move) + SetDestination(目标旁落点)
-//     QueueMission(Enter)               ← 再"进入"
-//   落点用 TechnoExt::PassengerKickOutLocation（与 10062 主流程完全一致）。
-//
-// 【走过弯路的记录（别再重走）】
-//   · 钩 FootClass::Find_Dock（0x4DEE80）出口 —— 那函数全 exe 无 call，不在路上。
-//   · 只在"该写 EAX 还是 ESI"之间来回换 —— 都不是关键，关键见上面两条。
-//   · 曾以为"同时写 ESI+EAX 会崩" —— 其实是探针自己崩的：诊断用的入口钩子挂在
-//     0x73EB32，吃掉了 `test ecx,ecx` 却没恢复标志位，导致紧随的 `je 0x73EB5A`
-//     读到 C++ 留下的垃圾标志位 → 走错分支 → 崩在 0x4DF07A（与 Harvest 无关的
-//     通用容器操作里）。
-//     **教训（同一个坑摔了两次）**：钩掉一条"设标志位"的指令（`test`/`cmp`）后，
-//     必须在钩子里把那条指令重做一遍，否则后续条件跳转读到的是垃圾标志位。
-//
-// 生效条件（四个全满足才动手，缺一即完全放行、退回原版行为）
-//   ① 是矿车（UnitTypeClass::Harvester）
-//   ② 满载（GetStoragePercentage() >= 0.999）
-//   ③ 所属小队的脚本里启用了 10062（ScriptExt::IsTeamUsingMoveEnterAction）
-//      —— 不是"此刻正停在这一行"：矿车满载时小队往往已在后续行上
-//   ④ 场上找得到"盟友的、不是自家的、可达的"精炼厂
+//   进入时：EAX = 引擎自己找到的建筑（自家精炼厂，或 0 = 没找到）
+//   离开时：EAX/ESI = 我们要它去的建筑，并按 bl 走引擎原本的分支
 // ---------------------------------------------------------------------------
 DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 {
-	enum { Continue = 0x73EB88 }; // → 让引擎自己执行 test bl,bl（标志位不能被破坏）
+	// 引擎原本在这条指令之后的两条支路（必须自己显式跳，不能靠标志位）：
+	//   0x73EB88  jne 0x73EDC0   ; bl ≠ 0
+	//   0x73EB8E  test esi,esi   ; bl ＝ 0
+	enum { Path_BlZero = 0x73EB8E, Path_BlNonZero = 0x73EDC0 };
 
 	GET(FootClass* const, pFoot, EBP);
+	GET(BuildingClass* const, pOriginalTarget, EAX);
 
-	BuildingClass* const pTarget = AlliedRefineryDock::GetRedirectTarget(pFoot);
+	BuildingClass* const pAlliedRefinery = AlliedRefineryDock::GetRedirectTarget(pFoot);
+	BuildingClass* const pResult = pAlliedRefinery ? pAlliedRefinery : pOriginalTarget;
 
-	if (!pTarget)
-		return Continue;
+	// 引擎接下来三条支路全都从 ESI 取"落点建筑"（0x73EB96 mov edx,[esi] /
+	// 0x73EDC8 mov eax,[esi] / 0x73EC4D mov esi,eax）。
+	// 0x73EB86 的 `mov esi,eax` 已被本钩子跳过，所以 ESI 由我们写。
+	R->EAX(pResult);
+	R->ESI(pResult);
 
-	// ---- ⓪ 防崩：把 ESI 换成合法建筑（必须无条件、且在任何守卫【之前】）----
-	//
-	// ⚠️⚠️⚠️ 这一行绝不能放到任何 return 之后 —— 这是实测踩出来的崩溃：
-	//
-	//   曾把 HasAnyLink() 守卫放到本行前面，结果：
-	//     对接成功那一帧 HasAnyLink() 为真 → 函数提前 return
-	//     → ESI 没被替换，仍是引擎返回的垃圾值（ebp+0xC8）
-	//     → 引擎拿它当建筑解引用 → 崩在 0x73EB9F
-	//     （状态记录仪当时只写了 3 行就断在那儿，正好对上）
-	//
-	//   引擎紧接着的执行路径三条都要 ESI 装"建筑"：
-	//     BL=0 → 0x73EB86 mov esi,eax → 0x73EB8E test esi,esi → 0x73EB96 mov edx,[esi]
-	//     BL≠0 → 0x73EB88 jne 0x73EDC0 → 0x73EDC8 mov eax,[esi]
-	//     挑不到 → 0x73EB90 je 0x73EC1F（只有这条会自己重新 mov esi,eax）
-	//   而"长征方没有自家精炼厂"时，[eax+0x528] 返回的不是建筑指针而是内部字段地址，
-	//   所以**每一次都必须替换**，不能有任何提前返回绕开它。
-	R->ESI(pTarget);
-
-	// ---- 状态变化记录（诊断用；只在任务/状态改变时写一行）----
-	// 目的：看清矿车从"移动 → 进入 → 倒矿"到底走到哪一步、卡在哪。
+	// ---- 状态变化记录（诊断用；只在状态改变时写一行）----
+	// 只记变化 + 每行 fflush，所以"崩了也不丢"，且不刷屏。
 	{
 		static FILE* s_log = nullptr;
 		static DWORD s_lastKey = 0xFFFFFFFF;
 		static int   s_lines = 0;
 
 		const DWORD curMission = static_cast<DWORD>(pFoot->GetCurrentMission());
-		const DWORD curStatus  = static_cast<DWORD>(pFoot->MissionStatus);
-		const DWORD linked     = (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget) ? 1 : 0;
-		const DWORD key = (curMission << 20) ^ (curStatus << 8) ^ linked;
+		const DWORD curStatus = static_cast<DWORD>(pFoot->MissionStatus);
+		const DWORD linked = (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pResult) ? 1 : 0;
+		const DWORD redirected = pAlliedRefinery ? 1 : 0;
+		const DWORD key = (curMission << 20) ^ (curStatus << 8) ^ (linked << 4) ^ redirected;
 
-		if (key != s_lastKey && s_lines < 80)
+		if (key != s_lastKey && s_lines < 60)
 		{
 			s_lastKey = key;
 			++s_lines;
@@ -257,7 +257,7 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 
 				if (s_log)
 				{
-					fprintf(s_log, "=== 10062 docking trace ===\n");
+					fprintf(s_log, "=== 10062 allied-refinery redirect trace ===\n");
 					fflush(s_log);
 				}
 			}
@@ -265,78 +265,23 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 			if (s_log)
 			{
 				fprintf(s_log,
-					"#%-3d mission=%-3u status=%-3u storage=%.3f archiveTarget=%p linkedToTarget=%u\n",
+					"#%-3d mission=%-3u status=%-3u storage=%.3f dest=%p archiveTarget=%p "
+					"engineSaid=%p weReturned=%p redirected=%u linked=%u typeFlag=0x%02X\n",
 					s_lines,
 					static_cast<unsigned>(curMission),
 					static_cast<unsigned>(curStatus),
 					pFoot->GetStoragePercentage(),
+					pFoot->Destination,
 					pFoot->ArchiveTarget,
-					static_cast<unsigned>(linked));
+					pOriginalTarget,
+					pResult,
+					static_cast<unsigned>(redirected),
+					static_cast<unsigned>(linked),
+					AlliedRefineryDock::ReadTypeFlag0xCD4(pFoot) ? 0xFF : 0x00);
 				fflush(s_log);
 			}
 		}
 	}
 
-	// ---- ① 已经对接上精炼厂了 → 立刻停手（ESI 已在上面无条件替换过）----
-	//
-	// ⚠️ 这条守卫可以放在这里，因为**防崩的 ESI 替换已经在最前面无条件做完了**。
-	//    曾经把它放在 ESI 替换之前 → 对接成功那一帧提前 return → ESI 仍是垃圾
-	//    → 崩在 0x73EB9F。保命操作必须在所有守卫之前。
-	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
-		return Continue;
-
-	// ⚠️⚠️ 守卫：已经在回【这座盟友精炼厂】了 → 停手
-	//
-	//    ❌ 千万不能写成 `if (pFoot->ArchiveTarget) return Continue;` ——
-	//       实测（a41e424）就是栽在这一行：
-	//       探针第一行就显示 archiveTarget=10F1C6D0（非空），于是钩子立刻放行、
-	//       什么都不做，矿车【采完矿原地不动】。
-	//
-	//       原因：ArchiveTarget 对矿车来说【也用来记住矿田在哪】。
-	//       YRpp/TechnoClass.h:624 原文：
-	//         "Set when told to guard a unit or such, ... Also used by rally points
-	//          as well as harvesters for remembering ore fields etc."
-	//       矿车采完矿时，这个字段里装的是【矿田】，不是精炼厂。
-	//
-	//    ✅ 必须比较"是不是同一座盟友精炼厂"，而不是"是否非空"。
-	if (pFoot->ArchiveTarget == pTarget)
-		return Continue;
-
-	// ---- 下达"回厂倒矿"指令 ----
-	//
-	// ⚠️⚠️⚠️ 对矿车来说，让引擎回精炼厂倒矿的正确指令是
-	//      **Mission::Harvest + MissionStatus = 2**，【不是 Mission::Enter】。
-	//
-	// 证据一（引擎自己的代码 @0x742F30）：
-	//     00742F33  push 7                         ; Mission::Enter
-	//     00742F37  call dword ptr [edx + 0x1e8]   ; 引擎排队的也是 Enter
-	//
-	// 证据二（Phobos 专门为这件事挂了钩子，Hooks.Harvester.cpp:9）：
-	//     DEFINE_HOOK(0x74312A, UnitClass_SetDestination_ReplaceWithHarvestMission, 0x5)
-	//     注释原文："Here change the Mission::Enter to Mission::Harvest"
-	//         pThis->QueueMission(Mission::Harvest, false);
-	//         pThis->NextMission();
-	//         pThis->MissionStatus = 2;   // Status: returning to refinery
-	//         pThis->IsHarvesting = false;
-	//
-	// 也就是说：**连引擎自己排的 Enter 都是错的，Phobos 得专门把它改成 Harvest**。
-	// 我前面几轮一直排 Enter，等于在重复引擎那个错误 → 矿车进了门就永远卡住
-	// （探针日志佐证：只有 2 行，第 2 行仍是 mission=10，之后我们的钩子再没被调用，
-	//  说明矿车已离开 Harvest 任务、卡死在 Enter 里）。
-	//
-	// 与 Phobos 那四行的唯一差别：**不要 NextMission()**。
-	//    实测（2fba935）：加上 NextMission() 会把刚设的 MissionStatus 冲掉，
-	//    矿车进入"该去采矿"的状态，原地发呆完全不动。所以只做后三步。
-	UnitClass* const pUnit = abstract_cast<UnitClass*>(pFoot);
-
-	if (!pUnit)
-		return Continue;
-
-	pUnit->SetArchiveTarget(pTarget);               // 记住要回哪座
-	pUnit->SetTarget(nullptr);
-	pUnit->QueueMission(Mission::Harvest, false);   // 回厂倒矿（不是 Enter！）
-	pUnit->MissionStatus = 2;                       // Status: returning to refinery
-	pUnit->IsHarvesting = false;
-
-	return Continue;
+	return AlliedRefineryDock::ReadTypeFlag0xCD4(pFoot) ? Path_BlNonZero : Path_BlZero;
 }

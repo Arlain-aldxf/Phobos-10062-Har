@@ -277,64 +277,56 @@ DEFINE_HOOK(0x73EB84, FootClass_HarvestReturn_PreferAlliedRefinery, 0x2)
 		}
 	}
 
-	// ---- ① 已经对接上精炼厂了 → 立刻停手（但 ESI 已经在上面替换过了）----
+	// ---- ① 已经对接上精炼厂了 → 立刻停手（ESI 已在上面无条件替换过）----
 	//
 	// ⚠️ 这条守卫可以放在这里，因为**防崩的 ESI 替换已经在最前面无条件做完了**。
 	//    曾经把它放在 ESI 替换之前 → 对接成功那一帧提前 return → ESI 仍是垃圾
 	//    → 崩在 0x73EB9F。保命操作必须在所有守卫之前。
-	//
-	// 状态记录仪抓到的真相（probe10062.log，两行一组交替出现）：
-	//     mission=10 status=2 archiveTarget=132ABD18  linkedToTarget=0
-	//     mission=10 status=2 archiveTarget=00000000  linkedToTarget=1   <- 对接上了
-	//     mission=10 status=2 archiveTarget=132ABD18  linkedToTarget=0   <- 又被拆开
-	//     ...
-	//
-	// 即：**矿车确实跟精炼厂对接成功过（linkedToTarget=1），
-	//     但我们的钩子每帧重写目标，把对接状态反复打断** ——
-	//     永远在"对接成功 → 被打断 → 再对接"之间翻滚，倒矿自然完不成。
 	if (pFoot->HasAnyLink() && pFoot->GetNthLink(0) == pTarget)
 		return Continue;
 
-	// ⚠️⚠️ 守卫：目标已经定好了就【彻底停手】
+	// ⚠️⚠️ 守卫：引擎已经在处理这座目标了 → 停手
 	//
-	//    这个钩子**每一帧都会被调用**（矿车满载期间引擎一直在跑 Harvest 任务），
-	//    而钩点 0x73EB84 本身就位于 Harvest 任务内部 ——
-	//    所以"Enter/Unload 就不打扰"这种判断在这里根本用不上（实测教训）。
-	//
-	//    真正该判断的是：**这辆矿车是不是已经在去这个目标的路上了**。
-	//    若是，就让引擎自己走完"走到 → 对接 → 倒矿"，别再重下指令。
-	//
-	//    反面教训（都实测过）：
-	//      · 每帧重下 Move/Enter → 矿车在矿场旁疯狂抖动、超时空矿车留下一串传送残影
-	//      · 只重下 Move 不守卫   → 矿车停在矿口不进（"准备对接"被反复重置）
-	//
-	//    Mission.Move.cpp 的注释也是这个意思："Only re-issue while the harvester
-	//    is still on its way there."
-	if (pFoot->ArchiveTarget == pTarget)
+	//    引擎自己会维护 ArchiveTarget：设立目标 → 对接 → 清空 → 倒矿。
+	//    只要它非空，就说明流程正在走，不要再插手下指令。
+	if (pFoot->ArchiveTarget)
 		return Continue;
 
-	// ⚠️⚠️ 这一段的每一行都是实测换来的，别随手改。
+	// ---- 下达"回厂倒矿"指令 ----
 	//
-	//   为什么【不写 ArchiveTarget】：
-	//     状态记录仪显示，只要我们不碰这个字段，引擎自己会：
-	//         设立目标 -> 对接成功（link 建立）-> 清空 ArchiveTarget -> 倒矿
-	//     而我们每写一次 ArchiveTarget，就把这个流程打回原点。所以这里只下达
-	//     "移动 + 进入"，目标字段交给引擎自己维护。
+	// ⚠️⚠️⚠️ 对矿车来说，让引擎回精炼厂倒矿的正确指令是
+	//      **Mission::Harvest + MissionStatus = 2**，【不是 Mission::Enter】。
 	//
-	//   移动必须靠 SetDestination + QueueMission(Move)：
-	//     (A) 目的地=旁边那格 → 矿车真的会移动过去，但停在门口不进
-	//     (B) 目的地=建筑本身 → 本版（让引擎自己去算该停哪个停机位）
-	//     (C) Harvest + NextMission + MissionStatus=2（照抄 Hooks.Harvester.cpp）
-	//         → 矿车完全不动：NextMission() 会把刚设的 MissionStatus 冲掉
+	// 证据一（引擎自己的代码 @0x742F30）：
+	//     00742F33  push 7                         ; Mission::Enter
+	//     00742F37  call dword ptr [edx + 0x1e8]   ; 引擎排队的也是 Enter
+	//
+	// 证据二（Phobos 专门为这件事挂了钩子，Hooks.Harvester.cpp:9）：
+	//     DEFINE_HOOK(0x74312A, UnitClass_SetDestination_ReplaceWithHarvestMission, 0x5)
+	//     注释原文："Here change the Mission::Enter to Mission::Harvest"
+	//         pThis->QueueMission(Mission::Harvest, false);
+	//         pThis->NextMission();
+	//         pThis->MissionStatus = 2;   // Status: returning to refinery
+	//         pThis->IsHarvesting = false;
+	//
+	// 也就是说：**连引擎自己排的 Enter 都是错的，Phobos 得专门把它改成 Harvest**。
+	// 我前面几轮一直排 Enter，等于在重复引擎那个错误 → 矿车进了门就永远卡住
+	// （探针日志佐证：只有 2 行，第 2 行仍是 mission=10，之后我们的钩子再没被调用，
+	//  说明矿车已离开 Harvest 任务、卡死在 Enter 里）。
+	//
+	// 与 Phobos 那四行的唯一差别：**不要 NextMission()**。
+	//    实测（2fba935）：加上 NextMission() 会把刚设的 MissionStatus 冲掉，
+	//    矿车进入"该去采矿"的状态，原地发呆完全不动。所以只做后三步。
 	UnitClass* const pUnit = abstract_cast<UnitClass*>(pFoot);
 
 	if (!pUnit)
 		return Continue;
 
+	pUnit->SetArchiveTarget(pTarget);               // 记住要回哪座
 	pUnit->SetTarget(nullptr);
-	pUnit->SetDestination(pTarget, true);
-	pUnit->QueueMission(Mission::Move, false);
-	pUnit->QueueMission(Mission::Enter, false);
+	pUnit->QueueMission(Mission::Harvest, false);   // 回厂倒矿（不是 Enter！）
+	pUnit->MissionStatus = 2;                       // Status: returning to refinery
+	pUnit->IsHarvesting = false;
 
 	return Continue;
 }

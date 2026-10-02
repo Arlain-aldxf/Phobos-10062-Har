@@ -105,20 +105,61 @@ namespace AlliedRefineryDock
 	}
 
 	// ------------------------------------------------------------------------
+	// 统一的"在某座 House 的建筑列表里找这一类建筑"，取最近的一座。
+	//
+	// ⚠️ 为什么自己写、不调引擎的原函数：
+	//    实测（快照 20261002-164516）确认，引擎原函数内部遍历
+	//    [House+0x5500] 那个建筑列表容器时，会是空指针 + 0x5500 偏移
+	//    （ESI=0x5500）→ C0000005 at 0x49FAE9。
+	//    即"长征方这座 House 没有建筑"这个边缘状态下，引擎自己那段代码不健壮。
+	//    所以这里改成全程自己走 YRpp 的 Buildings 列表（同一个安全迭代方式），
+	//    完全不进入引擎那个函数 —— 这才是绕开崩溃的关键。
+	//
+	// 判据刻意保持宽松（只看类型/存活/在场），与原规则的匹配口径一致：
+	//   · 类型必须 == arg1（原规则也是这么比的，见 0x4DEEF4）
+	//   · 必须是能倒矿的建筑
+	//   · "停靠位已满"那个标志（BuildingClass+0x3D3）没有复刻 ——
+	//     YRpp 里无对应命名，猜名字等于引入猜测。影响仅限"多座等距"时可能选中已满的，
+	//     而引擎对接失败会自行重试（0x73EE62），不会死锁。
+	// ------------------------------------------------------------------------
+	static BuildingClass* FindDockInHouse(HouseClass* pHouse, FootClass* pFoot,
+		BuildingTypeClass* pDockType)
+	{
+		if (!pHouse || !pFoot || !pDockType)
+			return nullptr;
+
+		BuildingClass* pBest = nullptr;
+		int bestDistance = 0;
+
+		for (BuildingClass* const pBuilding : pHouse->Buildings)
+		{
+			if (!pBuilding || !pBuilding->IsAlive || !pBuilding->IsOnMap)
+				continue;
+
+			BuildingTypeClass* const pType = pBuilding->Type;
+
+			if (!pType || pType != pDockType)
+				continue;                                 // 与原规则同样的类型比对
+
+			if (!pType->Refinery && !pType->DockUnload)
+				continue;                                 // 得是能倒矿的建筑
+
+			const int distance = pFoot->DistanceFrom(pBuilding);
+
+			if (!pBest || distance < bestDistance)
+			{
+				pBest = pBuilding;
+				bestDistance = distance;
+			}
+		}
+
+		return pBest;
+	}
+
+	// ------------------------------------------------------------------------
 	// 非所有者所属方的候选中枢
 	//   · 必须是别的阵营（排除自己）
-	//   · 必须与之同盟
-	//   · 必须是活着的、在场的精炼厂类建筑
-	//   · 类型必须与调用方要找的 arg1 一致（与原规则的匹配口径完全相同）
-	//   · 取最近的一座
-	//
-	//   ⚠️ 如实标注一处【有意的简化】：
-	//      原规则在"距离相同"时还会看一个占用标志（BuildingClass+0x3D3），
-	//      用来避免选中"停靠位已满"的建筑。本实现暂未复刻这一步 ——
-	//      因为该字段在 YRpp 里没有对应命名，猜名字等于引入猜测。
-	//      影响范围：只在"多座距离相同的盟友精炼厂"时可能选中已满的那座；
-	//      而引擎在后续对接失败时会自行重试（0x73EE62 jne 0x73EC1F），所以不会死锁。
-	//      若实测发现卡顿，再回来处理这里，不预先猜。
+	//   · 必须与之同盟（IsAlliedWith —— 与 10062 实测通过的那条路同一个判据）
 	// ------------------------------------------------------------------------
 	static BuildingClass* FindNonOwnerDock(FootClass* pFoot, BuildingTypeClass* pDockType)
 	{
@@ -135,34 +176,21 @@ namespace AlliedRefineryDock
 			if (!pHouse || pHouse == pFoot->Owner)
 				continue;                                     // 排除自己
 
-			// 非所有者所属方 —— 不与自己同盟的直接出局
 			if (!pFoot->Owner->IsAlliedWith(pHouse))
+				continue;                                     // 只要同盟
+
+			BuildingClass* const pCandidate =
+				FindDockInHouse(pHouse, pFoot, pDockType);
+
+			if (!pCandidate)
 				continue;
 
-			for (BuildingClass* const pBuilding : pHouse->Buildings)
+			const int distance = pFoot->DistanceFrom(pCandidate);
+
+			if (!pBest || distance < bestDistance)
 			{
-				if (!pBuilding || !pBuilding->IsAlive || !pBuilding->IsOnMap)
-					continue;
-
-				BuildingTypeClass* const pType = pBuilding->Type;
-
-				if (!pType)
-					continue;
-
-				// 与原规则的匹配口径一致：类型必须就是调用方要找的那一类
-				if (pType != pDockType)
-					continue;
-
-				if (!pType->Refinery && !pType->DockUnload)
-					continue;                                 // 得是能倒矿的建筑
-
-				const int distance = pFoot->DistanceFrom(pBuilding);
-
-				if (!pBest || distance < bestDistance)
-				{
-					pBest = pBuilding;
-					bestDistance = distance;
-				}
+				pBest = pCandidate;
+				bestDistance = distance;
 			}
 		}
 
@@ -191,7 +219,25 @@ namespace AlliedRefineryDock
 	using OriginalTryNearestDockBuilding = BuildingClass*(__fastcall*)(
 		FootClass*, BuildingTypeClass*, DWORD, DWORD);
 
-	static constexpr DWORD TryNearestDockBuilding_Body = 0x4DEE91;
+	// ------------------------------------------------------------------------
+	// 注意：这里**故意保留**引擎原函数体的地址记录，但**不再调用它**。
+	//
+	//   为什么不再调用（第二轮实测的教训）：
+	//     快照 20261002-164516 的崩溃报告里，调用栈是
+	//       ESP+0x08 -> 0x004DEE91   （引擎原函数体）
+	//       ESP+0x04 -> 0x004DEEAA   （它内部 call 0x49FAE0）
+	//       崩溃点    -> 0x0049FAE9   mov edi,[esi+8]，ESI = 0x5500
+	//     即：引擎在遍历 [House+0x5500] 这个"自家建筑列表"容器时，
+	//     this 指针是"空指针 + 0x5500 偏移"。长征方这座 House 没有任何建筑，
+	//     引擎自己那段代码在这个边缘状态下不安全。
+	//
+	//   ⇒ 所以现在全程由我们自己走 YRpp 的 Buildings 列表（FindDockInHouse），
+	//     钩子直接返回结果，**完全不进入引擎那个函数**。这是绕开崩溃的关键。
+	//
+	//   地址仍记录在此，仅供将来需要重新核对指令边界时参考：
+	//     004DEE91  57    push edi          ← 函数体真正的起点
+	// ------------------------------------------------------------------------
+	static constexpr DWORD TryNearestDockBuilding_Body_Unused = 0x4DEE91;
 
 	// ------------------------------------------------------------------------
 	// 自己 House 里有没有"这一类建筑"？
@@ -332,46 +378,24 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 
 	GET(FootClass*, pThis, ECX);
 	GET_STACK(BuildingTypeClass*, pDockType, 0x4);
-	GET_STACK(DWORD, arg2, 0x8);
-	GET_STACK(DWORD, arg3, 0xC);
 
-	// ---- 探针：入口无条件记录，把五个判据的真实值全打出来 ----
+	// ---- 探针 ----
 	const bool ownHas = AlliedRefineryDock::OwnHouseHasDockBuilding(pThis, pDockType);
 	const bool supported = AlliedRefineryDock::ShouldSupportNonOwner(pThis);
 
-	// ---- 第一步：原版能搞定吗？能 → 完全不管 ----
+	BuildingClass* pFound = nullptr;
+
+	// ---- ① 原版优先级：自己 House 里先找（自己走列表，不引擎函数）----
 	if (ownHas)
-	{
-		AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, nullptr);
-		return 0;                       // 走 trampoline，原版逻辑一字不改
-	}
+		pFound = AlliedRefineryDock::FindDockInHouse(pThis->Owner, pThis, pDockType);
 
-	// ---- 第二步：这是"满载返程、且小队脚本带 10062"的矿车吗？不是 → 也不管 ----
-	if (!supported)
-	{
-		AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, nullptr);
-		return 0;                       // 同样交还原版
-	}
+	// ---- ② 自己家没有 → 补上"非所有者所属方" ----
+	if (!pFound && supported)
+		pFound = AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
 
-	// ---- 第三步：让原规则自己再走一遍（可能因为占用等原因它另有答案）----
-	using OriginalFn = AlliedRefineryDock::OriginalTryNearestDockBuilding;
-	BuildingClass* const pEngineSaid =
-		reinterpret_cast<OriginalFn>(AlliedRefineryDock::TryNearestDockBuilding_Body)(
-			pThis, pDockType, arg2, arg3);
+	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, pFound);
 
-	// ---- 第四步：补上"非所有者所属方" ----
-	BuildingClass* const pAlly = pEngineSaid
-		? nullptr
-		: AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
-
-	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, pEngineSaid, pAlly);
-
-	if (pEngineSaid)
-	{
-		R->EAX<BuildingClass*>(pEngineSaid);
-		return ResumeAt;                // 原版自己能挑到 → 用它的
-	}
-
-	R->EAX<BuildingClass*>(pAlly);
+	// ★ 无论结果如何都直接返回：**完全不进入引擎那个会崩的函数**
+	R->EAX<BuildingClass*>(pFound);
 	return ResumeAt;
 }

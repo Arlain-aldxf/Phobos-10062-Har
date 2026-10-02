@@ -11,6 +11,10 @@
 
 #include <Ext/Script/Body.h>
 
+#include <TeamClass.h>
+#include <ScriptClass.h>
+#include <ScriptTypeClass.h>
+
 #include <cstdio>   // 诊断用（出成品时连同下面的 Trace 一起删）
 
 // ============================================================================
@@ -253,9 +257,34 @@ namespace AlliedRefineryDock
 
 		const char* const typeName = (pDockType && pDockType->ID) ? pDockType->ID : "?";
 
+		// 队伍与脚本内容：搞清楚 IsTeamUsingMoveEnterAction 为什么为假
+		TeamClass* const pTeam = pFoot ? pFoot->Team : nullptr;
+		ScriptClass* const pScript = pTeam ? pTeam->CurrentScript : nullptr;
+		const char* scriptId = (pScript && pScript->Type && pScript->Type->ID) ? pScript->Type->ID : "-";
+
+		char acts[64] = { 0 };
+		if (pScript && pScript->Type)
+		{
+			int pos = 0;
+
+			for (int i = 0; i < 4 && pos < 50; ++i)
+			{
+				const int a = pScript->Type->ScriptActions[i].Action;
+				pos += _snprintf_s(acts + pos, sizeof(acts) - pos, _TRUNCATE, "%d,", a);
+
+				if (a == 0)
+					break;
+			}
+		}
+		else
+		{
+			strcpy_s(acts, "-");
+		}
+
 		fprintf(s_log,
 			"#%-4d storage=%.3f ownHas=%u supported=%u type=%s "
-			"engineSaid=%p weReturned=%p dest=%p mission=%u status=%u\n",
+			"engineSaid=%p weReturned=%p dest=%p mission=%u status=%u "
+			"team=%p script=%p scriptId=%s acts=[%s]\n",
 			s_calls,
 			pFoot ? pFoot->GetStoragePercentage() : -1.0f,
 			static_cast<unsigned>(ownHas ? 1 : 0),
@@ -264,7 +293,8 @@ namespace AlliedRefineryDock
 			pEngineSaid, pWeReturned,
 			pFoot ? pFoot->Destination : nullptr,
 			pFoot ? static_cast<unsigned>(pFoot->GetCurrentMission()) : 0u,
-			pFoot ? static_cast<unsigned>(pFoot->MissionStatus) : 0u);
+			pFoot ? static_cast<unsigned>(pFoot->MissionStatus) : 0u,
+			pTeam, pScript, scriptId, acts);
 		fflush(s_log);
 	}
 }

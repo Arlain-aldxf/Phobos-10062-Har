@@ -86,7 +86,7 @@ namespace AlliedRefineryDock
 	// ------------------------------------------------------------------------
 	static bool ShouldSupportNonOwner(FootClass* pFoot)
 	{
-		if (!pFoot)
+		if (!pFoot || !pFoot->Owner)
 			return false;
 
 		// ① 是矿车
@@ -99,8 +99,9 @@ namespace AlliedRefineryDock
 		if (pFoot->GetStoragePercentage() < 0.999)
 			return false;
 
-		// ③ 所属小队的脚本里启用了 10062
-		return ScriptExt::IsTeamUsingMoveEnterAction(pFoot->Team);
+		// ③ 不碰玩家自己手里的矿车 —— 玩家的矿车由玩家自己指挥，不替他做主。
+		//    这一条是"只影响 AI"的保护，同时也让"原生 AI 矿车行为"保持原样。
+		return !pFoot->Owner->IsControlledByCurrentPlayer();
 	}
 
 	// ------------------------------------------------------------------------

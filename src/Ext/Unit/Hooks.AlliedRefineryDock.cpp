@@ -275,7 +275,8 @@ namespace AlliedRefineryDock
 	//             之后每 200 条记一次（避免刷屏，但持续可见）。
 	// ------------------------------------------------------------------------
 	static void Trace(FootClass* pFoot, BuildingTypeClass* pDockType,
-		bool ownHas, bool supported, BuildingClass* pEngineSaid, BuildingClass* pWeReturned)
+		bool ownHas, bool supported, BuildingClass* pEngineSaid, BuildingClass* pWeReturned,
+		int* pOutDistance)
 	{
 		static FILE* s_log = nullptr;
 		static int   s_calls = 0;
@@ -330,14 +331,15 @@ namespace AlliedRefineryDock
 
 		fprintf(s_log,
 			"#%-4d storage=%.3f ownHas=%u supported=%u type=%s "
-			"engineSaid=%p weReturned=%p dest=%p mission=%u status=%u "
+			"weReturned=%p outDist=%d dest=%p mission=%u status=%u "
 			"team=%p script=%p scriptId=%s acts=[%s]\n",
 			s_calls,
 			pFoot ? pFoot->GetStoragePercentage() : -1.0f,
 			static_cast<unsigned>(ownHas ? 1 : 0),
 			static_cast<unsigned>(supported ? 1 : 0),
 			typeName,
-			pEngineSaid, pWeReturned,
+			pWeReturned,
+			pOutDistance ? *pOutDistance : -999,
 			pFoot ? pFoot->Destination : nullptr,
 			pFoot ? static_cast<unsigned>(pFoot->GetCurrentMission()) : 0u,
 			pFoot ? static_cast<unsigned>(pFoot->MissionStatus) : 0u,
@@ -349,35 +351,37 @@ namespace AlliedRefineryDock
 // ---------------------------------------------------------------------------
 // 【唯一的改动点】原始满载返程目标选取规则的入口
 //
-//   钩点 0x4DEE80，拷贝长度 0xB —— 逐条核对过的指令边界（别再手数）：
-//     004DEE80  83ec2c          sub  esp,0x2c            (3B) → 83
-//     004DEE83  8b442430        mov  eax,[esp+0x30]      (4B) → 87
-//     004DEE87  55              push ebp                 (1B) → 88
-//     004DEE88  56              push esi                 (1B) → 89
-//     004DEE89  8bf1            mov  esi,ecx             (2B) → 8B
-//     004DEE8B  8b88f80d0000    mov  ecx,[eax+0xdf8]     (6B) → 91
-//                                                        合计 0xB，落在 0x4DEE8B 边界上
-//   ⇒ 所以拷贝长度取 **0xB**，而不是 0xA（0xA 会切进 `mov esi,ecx` 中间，
-//     这正是上一次崩溃的直接原因：Syringe 日志里那条
-//     "Failed to decode instruction at 0x004DEE89 … faulty return 0 hook at 0x004DEE80"）。
+//   ★ 本轮换钩点：从 0x4DEE80 换到 **0x4DF050**。
 //
-//   两条返回路径：
-//     · 返回 0        → 执行 trampoline 里的序言，再回到 0x4DEE8B 继续原版逻辑。
-//                      **序言只跑这一遍**，栈与寄存器都是原版的，最安全。
-//     · 返回 ResumeAt → 跳过 trampoline，直接进函数体（序言被跳过）。
+//   为什么换 —— 三个理由，各自对应一次实测失败：
 //
-//   我们的策略是**尽量走"返回 0"**：先问一句"自己 House 有没有这一类建筑"，
-//   有就完全交给原版（连一次调用都不多）。只有"自己家确实没有"时才接管。
+//   ① 0x4DEE80 那个函数体的【尾声】与【序言】绑定：
+//        序言：sub esp,0x2c / push ebp / push esi / push edi   （0x4DEE80..0x4DEE8A）
+//        尾声：pop edi / pop esi / pop ebp / add esp,0x2c / ret 0x10
+//      我们跳过序言直接进函数体，尾声 `add esp,0x2c` 就会抬过头、
+//      `ret 0x10` 从错误位置取返回地址 ⇒ 跳到野地址（实测 EIP=0x00000000）。
+//      **钩 0x4DEE80 就绕不开这个绑定。**
 //
-//   ⚠️ 调用函数体时入口必须是 0x4DEE91（见上面 API 声明处的说明），
-//      不是 0x4DEE90 —— 后者是 `mov ecx,[eax+0xdf8]` 的最后一个字节。
+//   ② 0x4DF050 附近的尾声（0x4DF0B7）只做 `pop edi/esi/ebp/ebx/ecx`
+//      + `mov eax,ebp`，**没有 add esp、没有 ret 参数** —— 干干净净，
+//      不存在栈帧平衡问题。这是我们能安全接管的关键。
+//
+//   ③ 引擎在 `jle 0x4df0b7` 处判断 Dock 列表是否为空。
+//      列表为空时，代码仍会走到 0x4DF07A `mov ecx,[edx+edi*4]` 去取列表元素
+//      （edx = [[ebx+4]]，edi 从 0 起）—— **读越界**。
+//      实测崩溃报告的 EDI=0 正对应这里。我们提前接管，也就绕开了它。
+//
+//   钩点选 0x4DF050（5 字节，正好覆盖 `test eax,eax` + `jle rel8`），
+//   返回 0x4DF0B7（尾声）：尾声会用 EBP 作为返回值，所以我们先写 EBP，
+//   再让 `0x4DF0B8 mov eax,ebp` 把它送进 EAX。
 // ---------------------------------------------------------------------------
-DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
+DEFINE_HOOK(0x4DF050, FootClass_TryNearestDockBuilding_SupportNonOwner, 0x5)
 {
-	enum { ResumeAt = 0x4DEE91 };   // 钩点 + 0xB 再往后 6 字节：函数体真正的起点
+	enum { Epilogue = 0x4DF0B7 };   // 尾声：pop edi / mov eax,ebp / pop ... / ret
 
 	GET(FootClass*, pThis, ECX);
 	GET_STACK(BuildingTypeClass*, pDockType, 0x4);
+	GET_STACK(int*, pOutDistance, 0x8);
 
 	// ---- 探针 ----
 	const bool ownHas = AlliedRefineryDock::OwnHouseHasDockBuilding(pThis, pDockType);
@@ -385,7 +389,7 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 
 	BuildingClass* pFound = nullptr;
 
-	// ---- ① 原版优先级：自己 House 里先找（自己走列表，不引擎函数）----
+	// ---- ① 原版优先级：自己 House 里先找 ----
 	if (ownHas)
 		pFound = AlliedRefineryDock::FindDockInHouse(pThis->Owner, pThis, pDockType);
 
@@ -393,19 +397,13 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 	if (!pFound && supported)
 		pFound = AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
 
-	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, pFound);
+	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, pFound, pOutDistance);
 
-	// ★ 直接返回结果，**完全不进入引擎那个函数**。
-	//
-	//   两条理由（各自对应一次实测崩溃）：
-	//     ① 引擎函数体在"自家 House 没有建筑"时会崩：
-	//        快照 20261002-164516 → C0000005 at 0x49FAE9，ESI=0x5500
-	//        （它去取 [House+0x5500] 那个建筑列表容器，this 是空指针+偏移）
-	//     ② 函数体的尾声假定序言已铺好 0x38 字节栈帧
-	//        （pop edi/esi/ebp; add esp,0x2c; ret 0x10），
-	//        跳过序言直接调它会让 ret 从错误位置取返回地址。
-	//
-	//   ⇒ 所以自家查找也由 FindDockInHouse 完成，一次都不调引擎函数。
-	R->EAX<BuildingClass*>(pFound);
-	return ResumeAt;
+	// 尾声以 EBP 为返回值，所以写 EBP；同时填好那个"距离"输出参数
+	R->EBP(pFound);
+
+	if (pOutDistance)
+		*pOutDistance = pFound ? pThis->DistanceFrom(pFound) : -1;
+
+	return Epilogue;
 }

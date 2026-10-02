@@ -395,7 +395,17 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 
 	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, pFound);
 
-	// ★ 无论结果如何都直接返回：**完全不进入引擎那个会崩的函数**
+	// ★ 直接返回结果，**完全不进入引擎那个函数**。
+	//
+	//   两条理由（各自对应一次实测崩溃）：
+	//     ① 引擎函数体在"自家 House 没有建筑"时会崩：
+	//        快照 20261002-164516 → C0000005 at 0x49FAE9，ESI=0x5500
+	//        （它去取 [House+0x5500] 那个建筑列表容器，this 是空指针+偏移）
+	//     ② 函数体的尾声假定序言已铺好 0x38 字节栈帧
+	//        （pop edi/esi/ebp; add esp,0x2c; ret 0x10），
+	//        跳过序言直接调它会让 ret 从错误位置取返回地址。
+	//
+	//   ⇒ 所以自家查找也由 FindDockInHouse 完成，一次都不调引擎函数。
 	R->EAX<BuildingClass*>(pFound);
 	return ResumeAt;
 }

@@ -166,18 +166,51 @@ namespace AlliedRefineryDock
 
 	// ------------------------------------------------------------------------
 	// 原始规则的完整副本（按调用约定），供钩子调用
-	//   定义在 0x4DEE90（序言 sub esp,0x2c; mov eax,[esp+0x30] 之后的函数体）
+	//
+	//   ⚠️⚠️ 入口地址是 0x4DEE91，不是 0x4DEE90 —— 这一字节之差曾导致一次崩溃。
+	//      反汇编边界（已逐条核对，不要再手数）：
+	//        004DEE89  8bf1            mov  esi, ecx        (2B)
+	//        004DEE8B  8b88f80d0000    mov  ecx,[eax+0xdf8] (6B)  ← 结束于 0x4DEE91
+	//        004DEE91  57              push edi             (1B) ← ★ 函数体真正起点
+	//      0x4DEE90 是上面那条 6 字节指令的**最后一个字节**，
+	//      从那里进入会读到错位的操作数（实测表现为读 [0+0x2C] → 访问违例）。
 	//
 	//   ⚠️ 调用约定必须是 __fastcall，不能是 __cdecl：
 	//      · 原函数体用 `ret 0x10` —— 由【被调方】清 3 个栈参
 	//      · 参数顺序是 (this, arg1, arg2, arg3)，this 走 ECX
-	//      __fastcall 正好匹配：ECX = 第 1 个参数，其余右到左入栈，被调方清栈。
-	//      （x86 下没有 __thiscall 可显式写，__fastcall 是等价且可用的写法。）
+	//      __fastcall 正好匹配。x86 下没有 __thiscall 可显式写，__fastcall 等价可用。
+	//
+	//   ✅ 寄存器安全：函数体的尾声会 `pop edi/esi/ebp` 并 `add esp,0x2c`、
+	//      成对还原它自己压的栈；且它【从不写 EBX】。所以调用方寄存器不受影响。
 	// ------------------------------------------------------------------------
 	using OriginalTryNearestDockBuilding = BuildingClass*(__fastcall*)(
 		FootClass*, BuildingTypeClass*, DWORD, DWORD);
 
-	static constexpr DWORD TryNearestDockBuilding_Original = 0x4DEE90;
+	static constexpr DWORD TryNearestDockBuilding_Body = 0x4DEE91;
+
+	// ------------------------------------------------------------------------
+	// 自己 House 里有没有"这一类建筑"？
+	//
+	// 用途：先问一句"原规则能不能自己搞定"。能搞定就完全不接管，
+	//       让原版逻辑原样跑 —— 自家有精炼厂的场景因此零扰动。
+	//
+	// 判据刻意做得比原规则**宽松**（只看类型，不看对象标志/占用）：
+	//   宁可误判为"有"（于是交还原版），也不误判为"无"（于是抢过来）。
+	//   最坏情况只是"没帮上忙"，绝不会改变原版行为。
+	// ------------------------------------------------------------------------
+	static bool OwnHouseHasDockBuilding(FootClass* pFoot, BuildingTypeClass* pDockType)
+	{
+		if (!pFoot || !pFoot->Owner || !pDockType)
+			return false;
+
+		for (BuildingClass* const pBuilding : pFoot->Owner->Buildings)
+		{
+			if (pBuilding && pBuilding->Type == pDockType)
+				return true;
+		}
+
+		return false;
+	}
 
 	// ------------------------------------------------------------------------
 	// 诊断探针（出成品时删掉）
@@ -233,57 +266,64 @@ namespace AlliedRefineryDock
 // ---------------------------------------------------------------------------
 // 【唯一的改动点】原始满载返程目标选取规则的入口
 //
-//   钩点选 0x4DEE80，拷贝长度 0xA —— 正好覆盖原函数 6 条序言指令
-//   （sub esp,0x2c / mov eax,[esp+0x30] / push ebp / push esi / mov esi,ecx / push edi），
-//   落在一条完整指令边界上（0x4DEE8A），不会切进指令中间。
+//   钩点 0x4DEE80，拷贝长度 0xB —— 逐条核对过的指令边界（别再手数）：
+//     004DEE80  83ec2c          sub  esp,0x2c            (3B) → 83
+//     004DEE83  8b442430        mov  eax,[esp+0x30]      (4B) → 87
+//     004DEE87  55              push ebp                 (1B) → 88
+//     004DEE88  56              push esi                 (1B) → 89
+//     004DEE89  8bf1            mov  esi,ecx             (2B) → 8B
+//     004DEE8B  8b88f80d0000    mov  ecx,[eax+0xdf8]     (6B) → 91
+//                                                        合计 0xB，落在 0x4DEE8B 边界上
+//   ⇒ 所以拷贝长度取 **0xB**，而不是 0xA（0xA 会切进 `mov esi,ecx` 中间，
+//     这正是上一次崩溃的直接原因：Syringe 日志里那条
+//     "Failed to decode instruction at 0x004DEE89 … faulty return 0 hook at 0x004DEE80"）。
 //
-//   进入时寄存器布局 = 原函数被调用时的布局：
-//     ecx = 矿车（this），[esp+4] = arg1，[esp+8] = arg2，[esp+0xC] = arg3
-//   而原函数体（0x4DEE90）自己会再做一遍 `sub esp,0x2c` 并补上 push ebp/esi/edi，
-//   所以我们直接以 __fastcall 语义调它 —— 参数与栈的顺序天然对上，无需手工搬栈。
+//   两条返回路径：
+//     · 返回 0        → 执行 trampoline 里的序言，再回到 0x4DEE8B 继续原版逻辑。
+//                      **序言只跑这一遍**，栈与寄存器都是原版的，最安全。
+//     · 返回 ResumeAt → 跳过 trampoline，直接进函数体（序言被跳过）。
 //
-//   ✅ 不存在"寄存器污染"问题：
-//      原函数体里的 `pop edi/esi/ebp` 会成对还原它自己那三次 push；
-//      而它【从不写 EBX】（全文只读 [ebx+…]），所以调用方的 EBX 也不会被动。
-//      因此这里不需要额外保存/恢复任何寄存器，直接调用即可。
+//   我们的策略是**尽量走"返回 0"**：先问一句"自己 House 有没有这一类建筑"，
+//   有就完全交给原版（连一次调用都不多）。只有"自己家确实没有"时才接管。
 //
-//   🔴 必须显式返回 ResumeAt(0x4DEE8A)，不能 `return 0`：
-//      DEFINE_HOOK 的 `return 0` 语义是"**执行 trampoline 里打包好的原指令**"。
-//      而 trampoline 会执行那 5 条序言（sub esp,0x2c / push ebp / push esi / push edi）
-//      然后跳回 0x4DEE8A —— 可我们已经调过 0x4DEE90（它自己做过同样的序言并已 ret），
-//      序言执行两遍 + 手工填过 3 个栈参 ⇒ 栈立刻错位。
-//      ⇒ 所以这里**跳过 trampoline**，直接返回序言之后的位置。
+//   ⚠️ 调用函数体时入口必须是 0x4DEE91（见上面 API 声明处的说明），
+//      不是 0x4DEE90 —— 后者是 `mov ecx,[eax+0xdf8]` 的最后一个字节。
 // ---------------------------------------------------------------------------
-DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xA)
+DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 {
-	enum { ResumeAt = 0x4DEE8A };   // 钩点 + 0xA：序言之后、函数体第一条指令
+	enum { ResumeAt = 0x4DEE91 };   // 钩点 + 0xB 再往后 6 字节：函数体真正的起点
 
 	GET(FootClass*, pThis, ECX);
 	GET_STACK(BuildingTypeClass*, pDockType, 0x4);
 	GET_STACK(DWORD, arg2, 0x8);
 	GET_STACK(DWORD, arg3, 0xC);
 
-	// ---- 先按原规则走一遍（自己 House）----
+	// ---- 第一步：原版能搞定吗？能 → 完全不管 ----
+	if (AlliedRefineryDock::OwnHouseHasDockBuilding(pThis, pDockType))
+		return 0;                       // 走 trampoline，原版逻辑一字不改
+
+	// ---- 第二步：这是"满载返程、且小队脚本带 10062"的矿车吗？不是 → 也不管 ----
+	const bool supported = AlliedRefineryDock::ShouldSupportNonOwner(pThis);
+
+	if (!supported)
+		return 0;                       // 同样交还原版
+
+	// ---- 第三步：让原规则自己再走一遍（可能因为占用等原因它另有答案）----
 	using OriginalFn = AlliedRefineryDock::OriginalTryNearestDockBuilding;
-	BuildingClass* const pResult =
-		reinterpret_cast<OriginalFn>(AlliedRefineryDock::TryNearestDockBuilding_Original)(
+	BuildingClass* const pEngineSaid =
+		reinterpret_cast<OriginalFn>(AlliedRefineryDock::TryNearestDockBuilding_Body)(
 			pThis, pDockType, arg2, arg3);
 
-	if (pResult)
+	if (pEngineSaid)
 	{
-		// ★ 自己家有 → 原版行为，完全不变
-		R->EAX<BuildingClass*>(pResult);
-		return ResumeAt;
+		R->EAX<BuildingClass*>(pEngineSaid);
+		return ResumeAt;                // 原版自己能挑到 → 用它的
 	}
 
-	// ---- 自己 House 里没有 —— 补上"非所有者所属方" ----
-	const bool supported = AlliedRefineryDock::ShouldSupportNonOwner(pThis);
-	BuildingClass* pAlly = nullptr;
+	// ---- 第四步：补上"非所有者所属方" ----
+	BuildingClass* const pAlly = AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
 
-	if (supported)
-		pAlly = AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
-
-	AlliedRefineryDock::Trace(pThis, pResult, pAlly, supported, pAlly != nullptr);
+	AlliedRefineryDock::Trace(pThis, pEngineSaid, pAlly, supported, pAlly != nullptr);
 
 	R->EAX<BuildingClass*>(pAlly);
 	return ResumeAt;

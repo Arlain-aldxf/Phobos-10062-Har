@@ -214,28 +214,25 @@ namespace AlliedRefineryDock
 
 	// ------------------------------------------------------------------------
 	// 诊断探针（出成品时删掉）
-	//   只记"状态发生变化"的行，每行 fflush —— 崩了也不丢，且不刷屏。
-	//   判据看 dest：引擎有没有为这辆矿车真的设出目的地。
+	//
+	//   ★ 关键设计：在【钩子入口】就无条件记录，而不是等到门控之后。
+	//     上一版的教训：探针放在门控后面，结果"钩子没被调用"和"门控返回 false"
+	//     在日志里长得一模一样，白白多花一轮编译去猜。
+	//     现在每一条都把五个门控判据的真实值打出来，一眼就能看出卡在哪。
+	//
+	//   记录策略：前 40 条全记（覆盖"钩子被调用了多少次"这个事实），
+	//             之后每 200 条记一次（避免刷屏，但持续可见）。
 	// ------------------------------------------------------------------------
-	static void Trace(FootClass* pFoot, BuildingClass* pEngineSaid, BuildingClass* pWeReturned,
-		bool supported, bool hitNonOwner)
+	static void Trace(FootClass* pFoot, BuildingTypeClass* pDockType,
+		bool ownHas, bool supported, BuildingClass* pEngineSaid, BuildingClass* pWeReturned)
 	{
 		static FILE* s_log = nullptr;
-		static DWORD s_lastKey = 0xFFFFFFFF;
-		static int   s_lines = 0;
+		static int   s_calls = 0;
 
-		const DWORD mission = static_cast<DWORD>(pFoot->GetCurrentMission());
-		const DWORD status = static_cast<DWORD>(pFoot->MissionStatus);
-		const DWORD hasDest = pFoot->Destination ? 1u : 0u;
-		const DWORD key = (mission << 16) ^ (status << 8) ^ (hasDest << 7)
-			^ ((pEngineSaid ? 1u : 0u) << 6) ^ ((pWeReturned ? 1u : 0u) << 5)
-			^ ((supported ? 1u : 0u) << 4) ^ ((hitNonOwner ? 1u : 0u) << 3);
+		++s_calls;
 
-		if (key == s_lastKey || s_lines >= 80)
+		if (s_calls > 40 && (s_calls % 200) != 0)
 			return;
-
-		s_lastKey = key;
-		++s_lines;
 
 		if (!s_log)
 		{
@@ -243,23 +240,32 @@ namespace AlliedRefineryDock
 
 			if (s_log)
 			{
-				fprintf(s_log, "=== 10062 non-owner dock support trace ===\n");
+				fprintf(s_log, "=== 10062 non-owner dock support trace (v2) ===\n");
+				fprintf(s_log, "列说明: calls=钩子被调用次数 type=arg1(要找的建筑类型)\n");
+				fprintf(s_log, "        storage=装载率 ownHas=自己House有该类建筑? supported=门控\n");
+				fprintf(s_log, "        engineSaid=原规则结果 weReturned=我们补的结果 dest=最终目的地\n");
 				fflush(s_log);
 			}
 		}
 
-		if (s_log)
-		{
-			fprintf(s_log,
-				"#%-3d mission=%-3u status=%-3u storage=%.3f dest=%p "
-				"engineSaid=%p weReturned=%p supported=%u hitNonOwner=%u\n",
-				s_lines, static_cast<unsigned>(mission), static_cast<unsigned>(status),
-				pFoot->GetStoragePercentage(), pFoot->Destination,
-				pEngineSaid, pWeReturned,
-				static_cast<unsigned>(supported ? 1 : 0),
-				static_cast<unsigned>(hitNonOwner ? 1 : 0));
-			fflush(s_log);
-		}
+		if (!s_log)
+			return;
+
+		const char* const typeName = (pDockType && pDockType->ID) ? pDockType->ID : "?";
+
+		fprintf(s_log,
+			"#%-4d storage=%.3f ownHas=%u supported=%u type=%s "
+			"engineSaid=%p weReturned=%p dest=%p mission=%u status=%u\n",
+			s_calls,
+			pFoot ? pFoot->GetStoragePercentage() : -1.0f,
+			static_cast<unsigned>(ownHas ? 1 : 0),
+			static_cast<unsigned>(supported ? 1 : 0),
+			typeName,
+			pEngineSaid, pWeReturned,
+			pFoot ? pFoot->Destination : nullptr,
+			pFoot ? static_cast<unsigned>(pFoot->GetCurrentMission()) : 0u,
+			pFoot ? static_cast<unsigned>(pFoot->MissionStatus) : 0u);
+		fflush(s_log);
 	}
 }
 
@@ -298,15 +304,23 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 	GET_STACK(DWORD, arg2, 0x8);
 	GET_STACK(DWORD, arg3, 0xC);
 
-	// ---- 第一步：原版能搞定吗？能 → 完全不管 ----
-	if (AlliedRefineryDock::OwnHouseHasDockBuilding(pThis, pDockType))
-		return 0;                       // 走 trampoline，原版逻辑一字不改
-
-	// ---- 第二步：这是"满载返程、且小队脚本带 10062"的矿车吗？不是 → 也不管 ----
+	// ---- 探针：入口无条件记录，把五个判据的真实值全打出来 ----
+	const bool ownHas = AlliedRefineryDock::OwnHouseHasDockBuilding(pThis, pDockType);
 	const bool supported = AlliedRefineryDock::ShouldSupportNonOwner(pThis);
 
+	// ---- 第一步：原版能搞定吗？能 → 完全不管 ----
+	if (ownHas)
+	{
+		AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, nullptr);
+		return 0;                       // 走 trampoline，原版逻辑一字不改
+	}
+
+	// ---- 第二步：这是"满载返程、且小队脚本带 10062"的矿车吗？不是 → 也不管 ----
 	if (!supported)
+	{
+		AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, nullptr, nullptr);
 		return 0;                       // 同样交还原版
+	}
 
 	// ---- 第三步：让原规则自己再走一遍（可能因为占用等原因它另有答案）----
 	using OriginalFn = AlliedRefineryDock::OriginalTryNearestDockBuilding;
@@ -314,16 +328,18 @@ DEFINE_HOOK(0x4DEE80, FootClass_TryNearestDockBuilding_SupportNonOwner, 0xB)
 		reinterpret_cast<OriginalFn>(AlliedRefineryDock::TryNearestDockBuilding_Body)(
 			pThis, pDockType, arg2, arg3);
 
+	// ---- 第四步：补上"非所有者所属方" ----
+	BuildingClass* const pAlly = pEngineSaid
+		? nullptr
+		: AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
+
+	AlliedRefineryDock::Trace(pThis, pDockType, ownHas, supported, pEngineSaid, pAlly);
+
 	if (pEngineSaid)
 	{
 		R->EAX<BuildingClass*>(pEngineSaid);
 		return ResumeAt;                // 原版自己能挑到 → 用它的
 	}
-
-	// ---- 第四步：补上"非所有者所属方" ----
-	BuildingClass* const pAlly = AlliedRefineryDock::FindNonOwnerDock(pThis, pDockType);
-
-	AlliedRefineryDock::Trace(pThis, pEngineSaid, pAlly, supported, pAlly != nullptr);
 
 	R->EAX<BuildingClass*>(pAlly);
 	return ResumeAt;
